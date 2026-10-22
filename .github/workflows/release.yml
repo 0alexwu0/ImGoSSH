@@ -1,0 +1,110 @@
+name: release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ImGoSSH-windows-x64
+          - label: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            artifact: ImGoSSH-linux-x86_64
+          - label: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            artifact: ImGoSSH-macos-aarch64
+          - label: macos-x86_64
+            os: macos-14
+            target: x86_64-apple-darwin
+            artifact: ImGoSSH-macos-x86_64
+            test: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        id: version
+        shell: bash
+        run: echo "value=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Test
+        if: matrix.test != false
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: Package (Windows)
+        if: startsWith(matrix.label, 'windows')
+        shell: pwsh
+        run: |
+          $t = "target/${{ matrix.target }}/release"
+          $out = "${{ runner.temp }}/${{ steps.version.outputs.value }}"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          foreach ($n in 'imgossh','igssh','igscp','igsftp') { Copy-Item "$t/$n.exe" $out }
+          Copy-Item LICENSE, README.md $out
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = "${{ runner.temp }}/${{ matrix.artifact }}.zip"
+          $a = [IO.Compression.ZipFile]::Open($zip, 'Create')
+          foreach ($f in Get-ChildItem $out) {
+            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($a, $f.FullName, $f.Name) | Out-Null
+          }
+          $a.Dispose()
+          "ASSET=$zip" >> $env:GITHUB_ENV
+
+      - name: Package (Linux)
+        if: matrix.label == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)/ImGoSSH-${{ steps.version.outputs.value }}-linux-x86_64
+          mkdir -p "$d"
+          for n in imgossh igssh igscp igsftp; do cp "target/${{ matrix.target }}/release/$n" "$d/"; done
+          cp LICENSE README.md "$d/"
+          tar -C "$(dirname "$d")" -czf "${{ runner.temp }}/${{ matrix.artifact }}.tar.gz" "$(basename "$d")"
+          echo "ASSET=${{ runner.temp }}/${{ matrix.artifact }}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (macOS)
+        if: startsWith(matrix.label, 'macos')
+        shell: bash
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)/ImGoSSH-${{ steps.version.outputs.value }}-macos-${{ matrix.target == 'aarch64-apple-darwin' && 'aarch64' || 'x86_64' }}
+          mkdir -p "$d"
+          for n in imgossh igssh igscp igsftp; do cp "target/${{ matrix.target }}/release/$n" "$d/"; done
+          cp LICENSE README.md "$d/"
+          ditto -c -k --sequesterRsrc "$d" "${{ runner.temp }}/${{ matrix.artifact }}.zip"
+          echo "ASSET=${{ runner.temp }}/${{ matrix.artifact }}.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error

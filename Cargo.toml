@@ -1,0 +1,60 @@
+[package]
+name = "imgossh"
+version = "0.1.0"
+edition = "2021"
+description = "An SSH / SFTP / SCP workstation written in Rust"
+authors = ["Alex.Wu"]
+license = "Apache-2.0"
+default-run = "imgossh"
+
+[lib]
+name = "imgossh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "imgossh"
+path = "src/main.rs"
+
+[[bin]]
+name = "igssh"
+path = "src/bin/igssh.rs"
+
+[[bin]]
+name = "igscp"
+path = "src/bin/igscp.rs"
+
+[[bin]]
+name = "igsftp"
+path = "src/bin/igsftp.rs"
+
+[dependencies]
+eframe = "0.36"
+egui = "0.36"
+egui_extras = "0.36"
+
+russh = { version = "0.64", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "3.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "fs", "process", "signal"] }
+vt100 = "0.16"
+
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+clap = { version = "4", features = ["derive"] }
+dirs = "7"
+env_logger = "0.11"
+log = "0.4"
+percent-encoding = "2"
+rpassword = "7"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+portable-pty = "0.9"
+arboard = "3"
+rfd = "0.15"
+crossterm = "0.28"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+codegen-units = 16
+
