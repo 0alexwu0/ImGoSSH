@@ -82,17 +82,20 @@ pub struct Tab {
 }
 
 impl Tab {
+    /// The name shown in the tab strip.
+    ///
+    /// A remote tab _is_ the session it was opened from, so the name the user
+    /// gave it wins over whatever the shell reports about itself. A local
+    /// shell has no saved name worth showing, so its tab follows the program
+    /// running inside it.
     fn title(&self) -> String {
-        let emu = self.emu.lock().unwrap();
-        if !emu.title.is_empty() {
-            return emu.title.clone();
+        if !self.session.protocol.is_remote() {
+            let emu = self.emu.lock().unwrap();
+            if !emu.title.is_empty() {
+                return emu.title.clone();
+            }
         }
-        drop(emu);
-        match self.kind {
-            TabKind::Terminal => self.session.title(),
-            TabKind::Sftp => format!("SFTP {}", self.session.target()),
-            TabKind::Scp => format!("SCP {}", self.session.target()),
-        }
+        self.session.title()
     }
 }
 
@@ -149,12 +152,27 @@ pub struct App {
     /// Set on the frame the terminal menu opens, so the click that opened it
     /// cannot be mistaken for the click that dismisses it.
     term_menu_fresh: bool,
-    cell: Vec2,
+    /// The terminal grid every tab shares.
+    grid: Grid,
+    /// The `line_spacing` `grid` was measured against, so a change to it is
+    /// noticed without measuring the grid on every frame.
+    spacing: f32,
     font: FontId,
     cursor_on: bool,
     blink_at: f64,
 
     dirty: bool,
+}
+
+/// The grid a terminal tab paints into: what one cell costs, and the air a row
+/// gets around the glyphs inside it.
+#[derive(Clone, Copy, Default)]
+struct Grid {
+    /// The box one character cell takes, in points.
+    cell: Vec2,
+    /// Air `line_spacing` adds to a row, shared between its top and its bottom.
+    /// Zero leaves a row exactly as tight as the glyphs that fill it.
+    leading: f32,
 }
 
 impl App {
@@ -172,7 +190,8 @@ impl App {
         setup_fonts(cc, &store.config.font_family, store.config.font_size);
         // The font atlas only exists after the first `Context::run`, so the
         // cell metrics are measured on the first frame instead of here.
-        let cell = Vec2::ZERO;
+        let grid = Grid::default();
+        let spacing = 0.0;
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -202,7 +221,8 @@ impl App {
             show_about: false,
             term_menu: None,
             term_menu_fresh: false,
-            cell,
+            grid,
+            spacing,
             font,
             cursor_on: true,
             blink_at: 0.0,
@@ -701,7 +721,7 @@ fn add_symbol_fallback(fonts: &mut FontDefinitions) {
 }
 
 /// Chinese dates, file names and program messages need an East Asian face, and
-/// its glyphs must be exactly two terminal cells wide or the grid drifts left.
+/// its metrics have to be known before it can be kept inside the grid.
 fn add_cjk_fallback(fonts: &mut FontDefinitions) -> Option<&'static str> {
     let candidates: [(&str, &str); 4] = [
         ("Microsoft YaHei", r"C:\Windows\Fonts\msyh.ttc"),
@@ -718,9 +738,17 @@ fn add_cjk_fallback(fonts: &mut FontDefinitions) -> Option<&'static str> {
     install_fallback(fonts, &candidates)
 }
 
-/// Scale the East Asian fallback so one ideograph is exactly two terminal cells
-/// wide. The Latin side comes from the terminal face that now heads the family,
-/// so both are measured on one scale.
+/// Keep the East Asian fallback from overflowing the two cells an ideograph is
+/// charged, shrinking a face whose glyphs are too wide to fit them.
+///
+/// The Latin side comes from the terminal face that now heads the family, so
+/// both are measured on one scale. A face that fits is left exactly as it is:
+/// `FontTweak::scale` is uniform, so scaling an ideograph up to fill its pair
+/// of cells stretches it taller as well as wider, and lines of Chinese end up
+/// crowded both ways - the characters touching their neighbours and pressing on
+/// the rows above and below. Narrower than two cells is not a problem: the pen
+/// is snapped back onto the grid after every glyph anyway (see `append_cells`),
+/// so the leftover space is simply left where it falls.
 fn tune_cjk_scale(fonts: &mut FontDefinitions, name: &str, size: f32) {
     let latin = advance(fonts, 'M', size);
 
@@ -730,7 +758,8 @@ fn tune_cjk_scale(fonts: &mut FontDefinitions, name: &str, size: f32) {
         .insert(FontFamily::Monospace, vec![name.to_string()]);
     let cjk = advance(&probe, '\u{7528}', size);
 
-    if latin <= 0.0 || cjk <= 0.0 {
+    let scale = (2.0 * latin / cjk).min(1.0);
+    if latin <= 0.0 || cjk <= 0.0 || scale >= 1.0 {
         return;
     }
     let Some(current) = fonts.font_data.get(name) else {
@@ -738,7 +767,7 @@ fn tune_cjk_scale(fonts: &mut FontDefinitions, name: &str, size: f32) {
     };
     let mut tweaked = (**current).clone();
     tweaked.tweak = FontTweak {
-        scale: (2.0 * latin) / cjk,
+        scale,
         ..Default::default()
     };
     fonts.font_data.insert(name.to_string(), Arc::new(tweaked));
@@ -775,19 +804,29 @@ fn install_fallback(
     Some(name)
 }
 
-/// Width and height of one character cell, in points.
-fn measure_cell(ctx: &Context, font: &FontId) -> Vec2 {
-    // The advance and nothing else: every column is placed from this number, so
-    // it has to be the width the shaper itself charges for a glyph.
+/// The grid metrics for one terminal face at one size.
+///
+/// The width is the advance and nothing else: every column is placed from this
+/// number, so it has to be the width the shaper itself charges for a glyph.
+/// The height is the text box as `line_spacing` wants it. Latin asks for
+/// little; a page of Chinese fills its box from edge to edge, and the same row
+/// height reads as lines pressed against each other.
+fn measure_cell(ctx: &Context, font: &FontId, line_spacing: f32) -> Grid {
     let advance = ctx.fonts_mut(|fonts| fonts.glyph_width(font, 'M'));
     let galley =
         ctx.fonts_mut(|fonts| fonts.layout_no_wrap("M".to_string(), font.clone(), Color32::WHITE));
     let size = galley.size();
     let width = if advance > 0.0 { advance } else { size.x };
-    if width > 0.0 && size.y > 0.0 {
-        Vec2::new(width, size.y)
-    } else {
-        Vec2::new(8.0, 16.0)
+    if width <= 0.0 || size.y <= 0.0 {
+        return Grid {
+            cell: Vec2::new(8.0, 16.0),
+            leading: 0.0,
+        };
+    }
+    let height = size.y * line_spacing.clamp(0.6, 3.0);
+    Grid {
+        cell: Vec2::new(width, height),
+        leading: height - size.y,
     }
 }
 
@@ -819,9 +858,16 @@ impl App {
             }
             self.palette = palette;
         }
-        if font_changed {
-            self.cell = measure_cell(ctx, &font);
+        // The font atlas only exists once a frame is being laid out, which is
+        // why the grid is measured here rather than in `with_startup`: the
+        // first pass takes it, and so does any pass where the face, its size,
+        // or the requested line spacing has moved.
+        let spacing = self.store.config.line_spacing;
+        if font_changed || spacing != self.spacing || self.grid.cell.y <= 0.0 {
+            self.grid = measure_cell(ctx, &font, spacing);
+            self.spacing = spacing;
             self.font = font;
+            ctx.request_repaint();
         }
         if palette_changed || font_changed {
             self.apply_theme(ctx);
@@ -849,10 +895,6 @@ impl eframe::App for App {
         // Browser and transfer jobs call `tokio::spawn` straight from the UI.
         let _guard = self.runtime.enter();
         let ctx = ui.ctx().clone();
-
-        if self.cell.x <= 0.0 || self.cell.y <= 0.0 {
-            self.cell = measure_cell(&ctx, &self.font);
-        }
 
         self.sync_config(&ctx);
         self.record_window_size(&ctx);
@@ -1370,6 +1412,11 @@ impl App {
                         self.show_about = true;
                         ui.close();
                     }
+                    if ui.button(t!("GitHub repository")).clicked() {
+                        ui.ctx()
+                            .open_url(egui::OpenUrl::same_tab(crate::config::REPOSITORY_URL));
+                        ui.close();
+                    }
                     if ui.button(t!("Open settings folder")).clicked() {
                         let dir = crate::config::store_dir();
                         let _ = std::fs::create_dir_all(&dir);
@@ -1467,7 +1514,6 @@ impl App {
         });
         let muted = theme::muted(ui);
         let (good, warn, bad, idle) = theme::tones(ui);
-        let mut close = None;
         egui::Panel::bottom("statusbar")
             .frame(theme::bar(ui))
             .show(ui, |ui| {
@@ -1508,24 +1554,6 @@ impl App {
                                 .color(muted),
                         );
                     }
-                    if live {
-                        ui.separator();
-                        let button = egui::Button::new(
-                            egui::RichText::new(t!("\u{2715} Disconnect"))
-                                .size(11.5)
-                                .color(bad),
-                        )
-                        .small()
-                        .fill(Color32::TRANSPARENT)
-                        .stroke((1.0, bad));
-                        if ui
-                            .add(button)
-                            .on_hover_text(t!("Disconnect this session"))
-                            .clicked()
-                        {
-                            close = Some(index);
-                        }
-                    }
                     ui.separator();
                     // The monitor takes whatever room is left and clips rather than
                     // sliding under the version label.
@@ -1551,10 +1579,6 @@ impl App {
                     });
                 });
             });
-
-        if let Some(index) = close {
-            self.close_tab(index);
-        }
     }
 
     fn tab_bar(&mut self, ui: &mut Ui) {
@@ -1678,9 +1702,9 @@ impl App {
             TabKind::Terminal => {
                 let palette = self.palette.clone();
                 let font = self.font.clone();
-                let cell = self.cell;
+                let grid = self.grid;
                 let cursor_on = self.cursor_on;
-                self.terminal_pane(ui, index, &palette, &font, cell, cursor_on);
+                self.terminal_pane(ui, index, &palette, &font, grid, cursor_on);
             }
             TabKind::Sftp => {
                 let queue = self.queue.clone();
@@ -1699,7 +1723,7 @@ impl App {
         index: usize,
         palette: &Palette,
         font: &FontId,
-        cell: Vec2,
+        grid: Grid,
         cursor_on: bool,
     ) {
         // The server can repaint the palette through OSC 4/10/11/12.
@@ -1710,7 +1734,8 @@ impl App {
             .effective_palette(palette);
         let style = TermStyle {
             font: font.clone(),
-            cell,
+            cell: grid.cell,
+            leading: grid.leading,
             palette: &palette,
             cursor_on,
             pad: 10.0,
@@ -1831,10 +1856,12 @@ impl App {
             ui.horizontal_wrapped(|ui| {
                 for job in jobs {
                     let state = job.snapshot();
-                    ui.add(
-                        egui::ProgressBar::new(state.percent() / 100.0)
-                            .desired_width(190.0)
-                            .text(format!("{} {}", job.direction.arrow(), state.current)),
+                    theme::meter(
+                        ui,
+                        state.percent() / 100.0,
+                        190.0,
+                        format!("{} {}", job.direction.arrow(), state.current),
+                        accent,
                     );
                 }
             });
@@ -1854,12 +1881,10 @@ impl App {
     }
     fn welcome(&mut self, ui: &mut Ui) {
         let v = ui.visuals();
-        let (raised, border, hover, accent_dim, accent_text, muted, text) = (
+        let (raised, border, hover, muted, text) = (
             v.window_fill,
             v.widgets.noninteractive.bg_stroke.color,
             v.widgets.hovered.weak_bg_fill,
-            theme::accent_dim(ui),
-            theme::accent_text(ui),
             theme::muted(ui),
             v.text_color(),
         );
@@ -1908,17 +1933,7 @@ impl App {
                         .show(ui, |ui| {
                             ui.set_width(width - 36.0);
                             ui.horizontal(|ui| {
-                                let (rect, _) =
-                                    ui.allocate_exact_size(Vec2::splat(44.0), Sense::hover());
-                                ui.painter()
-                                    .rect_filled(rect, CornerRadius::same(13), accent_dim);
-                                ui.painter().text(
-                                    rect.center(),
-                                    Align2::CENTER_CENTER,
-                                    "\u{276f}\u{2581}",
-                                    FontId::monospace(16.0),
-                                    accent_text,
-                                );
+                                theme::logo(ui, 44.0);
                                 ui.add_space(6.0);
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
@@ -2187,15 +2202,6 @@ fn monitor_bar(ui: &mut Ui, info: &ServerInfo) {
         "load {:.2} / {:.2} / {:.2}",
         info.load[0], info.load[1], info.load[2]
     );
-    let pill = |ui: &mut Ui, ratio: f32, width: f32, text: String, color: Color32| {
-        ui.add(
-            egui::ProgressBar::new(ratio)
-                .desired_width(width)
-                .desired_height(14.0)
-                .fill(color)
-                .text(egui::RichText::new(text).size(11.0).color(dim)),
-        )
-    };
     let note = |ui: &mut Ui, text: String| -> Response {
         ui.label(egui::RichText::new(text).size(11.5).color(dim))
     };
@@ -2218,7 +2224,7 @@ fn monitor_bar(ui: &mut Ui, info: &ServerInfo) {
                     .on_hover_text(hover);
                     ui.separator();
                 }
-                pill(
+                theme::meter(
                     ui,
                     (info.cpu / 100.0) as f32,
                     86.0,
@@ -2228,7 +2234,7 @@ fn monitor_bar(ui: &mut Ui, info: &ServerInfo) {
                 .on_hover_text(load);
                 if info.mem_total > 0 {
                     let percent = info.mem_used as f64 / info.mem_total as f64 * 100.0;
-                    pill(
+                    theme::meter(
                         ui,
                         (percent / 100.0) as f32,
                         140.0,
@@ -2243,7 +2249,7 @@ fn monitor_bar(ui: &mut Ui, info: &ServerInfo) {
                 }
                 if info.swap_total > 0 {
                     let percent = info.swap_used as f64 / info.swap_total as f64 * 100.0;
-                    pill(
+                    theme::meter(
                         ui,
                         (percent / 100.0) as f32,
                         116.0,

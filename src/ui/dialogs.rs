@@ -1,11 +1,11 @@
 //! Modal dialogs: session properties, credentials, host keys, tunnels, settings.
 
-use egui::{Align2, CornerRadius, FontId, RichText, Sense, Ui, Vec2};
+use egui::{CornerRadius, FontId, RichText, Sense, Ui, Vec2};
 
 use crate::config::{Config, Protocol, Session, Tunnel, TunnelKind};
 use crate::i18n::{tr, Lang};
 use crate::ssh::client::{Challenge, HostKeyInfo, Reply, Trust};
-use crate::ssh::transfer::Queue;
+use crate::ssh::transfer::{Phase, Queue};
 use crate::t;
 use crate::ui::theme;
 use crate::util::{human_rate, human_size};
@@ -614,6 +614,19 @@ pub fn settings_dialog(ui: &mut Ui, config: &mut Config, open: &mut bool) -> boo
                                 .changed();
                             ui.end_row();
 
+                            ui.label(t!("Line spacing"));
+                            changed |= ui
+                                .add(
+                                    egui::DragValue::new(&mut config.line_spacing)
+                                        .speed(0.05)
+                                        .range(0.8..=2.5),
+                                )
+                                .on_hover_text(t!(
+                                    "Extra air between terminal rows. Larger values suit Chinese."
+                                ))
+                                .changed();
+                            ui.end_row();
+
                             ui.label(t!("Scrollback lines"));
                             changed |= ui
                                 .add(
@@ -755,8 +768,8 @@ pub fn transfers_dialog(ui: &mut Ui, queue: &Queue) -> bool {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let accent = theme::accent(ui);
-                    let muted = theme::muted(ui);
+                    let (good, _, bad, _) = theme::tones(ui);
+                    let (accent, muted) = (theme::accent(ui), theme::muted(ui));
                     for job in jobs {
                         let state = job.snapshot();
                         theme::card_with(ui, 10).show(ui, |ui| {
@@ -780,18 +793,20 @@ pub fn transfers_dialog(ui: &mut Ui, queue: &Queue) -> bool {
                                     },
                                 );
                             });
-                            ui.add(
-                                egui::ProgressBar::new(state.percent() / 100.0)
-                                    .desired_height(15.0)
-                                    .text(
-                                        RichText::new(t!(
-                                            "{0} - {1}",
-                                            state.phase.label(),
-                                            state.current
-                                        ))
-                                        .size(11.0),
-                                    )
-                                    .fill(accent),
+                            // Same on top of the bar as everywhere else: the
+                            // fill is a tint, the label keeps its own colour.
+                            let tone = match state.phase {
+                                Phase::Done => good,
+                                Phase::Failed(_) => bad,
+                                Phase::Cancelled => muted,
+                                _ => accent,
+                            };
+                            theme::meter(
+                                ui,
+                                state.percent() / 100.0,
+                                ui.available_width(),
+                                t!("{0} - {1}", state.phase.label(), state.current),
+                                tone,
                             );
                             ui.label(
                                 RichText::new(format!(
@@ -823,24 +838,10 @@ pub fn about_dialog(ui: &mut Ui) -> bool {
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .show(ui.ctx(), |ui| {
-            let (accent_dim, accent_text, muted, text) = (
-                theme::accent_dim(ui),
-                theme::accent_text(ui),
-                theme::muted(ui),
-                ui.visuals().text_color(),
-            );
+            let (muted, text) = (theme::muted(ui), ui.visuals().text_color());
             ui.set_width(360.0);
             ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::splat(42.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(rect, CornerRadius::same(12), accent_dim);
-                ui.painter().text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    "\u{276f}\u{2581}",
-                    FontId::monospace(16.0),
-                    accent_text,
-                );
+                theme::logo(ui, 42.0);
                 ui.add_space(10.0);
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
@@ -867,6 +868,46 @@ pub fn about_dialog(ui: &mut Ui) -> bool {
             ] {
                 ui.label(RichText::new(line).size(11.5).color(muted));
             }
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(t!("Author: {0}", crate::config::APP_AUTHOR))
+                    .size(11.5)
+                    .color(text),
+            );
+            ui.label(
+                RichText::new(t!("License: Apache License 2.0"))
+                    .size(11.5)
+                    .color(text),
+            );
+            ui.label(
+                RichText::new(t!(
+                    "Free to use, change and redistribute: see the LICENSE file for the full terms."
+                ))
+                .size(11.0)
+                .color(muted),
+            );
+            ui.label(
+                RichText::new(format!(
+                    "Copyright \u{a9} 2026 {}.",
+                    crate::config::APP_AUTHOR
+                ))
+                .size(11.0)
+                .color(muted),
+            );
+            ui.add_space(10.0);
+            let github = format!("{} {}", "\u{2197}", t!("GitHub repository"));
+            if theme::primary(ui, github)
+                .on_hover_text(crate::config::REPOSITORY_URL)
+                .clicked()
+            {
+                ui.ctx()
+                    .open_url(egui::OpenUrl::same_tab(crate::config::REPOSITORY_URL));
+            }
+            ui.label(
+                RichText::new(crate::config::REPOSITORY_URL)
+                    .size(10.5)
+                    .color(muted),
+            );
             ui.add_space(4.0);
             ui.label(
                 RichText::new(t!("Settings: {0}", crate::config::store_dir().display()))

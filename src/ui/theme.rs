@@ -5,10 +5,11 @@
 //! surface with a few deliberate highlights whichever theme is switched on.
 
 use egui::style::{ScrollStyle, Selection};
+use egui::ColorImage;
 use egui::{
-    Align, Color32, Context, CornerRadius, FontId, Frame, Margin, Response, Sense, Shadow, Spacing,
-    Stroke, Style, TextEdit, TextStyle, Theme as EguiTheme, ThemePreference, Ui, Vec2, Visuals,
-    WidgetText,
+    Align, Color32, Context, CornerRadius, FontId, Frame, Id, Image, Margin, Rect, Response, Sense,
+    Shadow, Spacing, Stroke, StrokeKind, Style, TextEdit, TextStyle, TextureHandle, TextureOptions,
+    Theme as EguiTheme, ThemePreference, Ui, Vec2, Visuals, WidgetText,
 };
 
 use crate::config::{Palette, Theme};
@@ -439,6 +440,75 @@ pub fn badge(ui: &mut Ui, text: &str, fg: Color32, bg: Color32) {
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     ui.painter().rect_filled(rect, CornerRadius::same(9), bg);
     ui.painter().galley(rect.min + pad, galley, fg);
+}
+
+/// One read-out drawn as a pill: the number is painted on top of the bar
+/// rather than inside a `ProgressBar`.
+///
+/// A `ProgressBar` paints its label in one colour across a fill in another, so
+/// every label straddled the edge where the bar turns from empty track into
+/// solid accent, green, amber or red - and one of those halves was always hard
+/// to read. Here the fill keeps only the state colour's hue at a low alpha and
+/// the label keeps the theme's text colour, so it reads the same on both halves.
+pub fn meter(ui: &mut Ui, ratio: f32, width: f32, text: String, color: Color32) -> Response {
+    let foreground = ui.visuals().text_color();
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text, FontId::proportional(11.0), foreground);
+    let height = 16.0;
+    // A pill is never narrower than its own label: clipped digits read as a
+    // wrong number rather than a truncated one.
+    let size = Vec2::new(width.max(galley.size().x + 12.0), height);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    if ui.is_rect_visible(rect) {
+        let radius = CornerRadius::same((height / 2.0) as u8);
+        let tint =
+            |alpha: u8| Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+        ui.painter()
+            .rect_filled(rect, radius, ui.visuals().extreme_bg_color);
+        let filled = rect.width() * ratio.clamp(0.0, 1.0);
+        if filled > 1.0 {
+            ui.painter().rect_filled(
+                Rect::from_min_size(rect.min, Vec2::new(filled, rect.height())),
+                CornerRadius::same(filled.min(height / 2.0) as u8),
+                tint(110),
+            );
+        }
+        ui.painter()
+            .rect_stroke(rect, radius, (1.0, tint(90)), StrokeKind::Inside);
+        ui.painter()
+            .galley(rect.center() - galley.size() / 2.0, galley, foreground);
+    }
+    response
+}
+
+/// The application tile, drawn from the same pixels as the window icon, the
+/// taskbar button and the `.ico` compiled into the executable.
+///
+/// The about window and the welcome card used to paint a hand-made `>_` badge,
+/// which quietly drifted away from the real icon every time the icon was
+/// retouched. There is now one picture and everybody borrows it.
+pub fn logo(ui: &mut Ui, size: f32) {
+    // Generous enough to stay sharp when the window is scaled up, and painted
+    // exactly once: the texture is kept on the context between frames.
+    const PAINT: u32 = 128;
+    let ctx = ui.ctx().clone();
+    let key = Id::new("app-logo");
+    let cached = ctx.data_mut(|data| data.get_temp::<TextureHandle>(key));
+    let texture = cached.unwrap_or_else(|| {
+        let image = ColorImage::from_rgba_unmultiplied(
+            [PAINT as usize, PAINT as usize],
+            &crate::icon::paint(PAINT),
+        );
+        let texture = ctx.load_texture("imgossh-logo", image, TextureOptions::LINEAR);
+        ctx.data_mut(|data| data.insert_temp(key, texture.clone()));
+        texture
+    });
+    ui.add(
+        Image::new(&texture)
+            .fit_to_exact_size(Vec2::splat(size))
+            .sense(Sense::hover()),
+    );
 }
 
 /// A heading with an accent bar, used to break dialogs into sections.

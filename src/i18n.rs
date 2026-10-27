@@ -359,7 +359,6 @@ fn zh(key: &'static str) -> &'static str {
         "connected" => "已连接",
         "closed" => "已断开",
         "exit code {0}" => "退出码 {0}",
-        "Disconnect this session" => "断开此会话",
         "reading server stats…" => "正在读取服务器状态…",
         "Logged-in accounts" => "已登录账户",
         "Uptime" => "运行时间",
@@ -378,6 +377,9 @@ fn zh(key: &'static str) -> &'static str {
         "LOCAL" => "\u{672c}\u{5730}",
         "Double-click to connect" => "\u{53cc}\u{51fb}\u{8fde}\u{63a5}",
         "Font size" => "\u{5b57}\u{53f7}",
+        "Line spacing" => "\u{884c}\u{8ddd}",
+        "Extra air between terminal rows. Larger values suit Chinese." =>
+            "\u{7ec8}\u{7aef}\u{6bcf}\u{884c}\u{6587}\u{5b57}\u{4e0a}\u{4e0b}\u{7684}\u{989d}\u{5916}\u{7559}\u{767d}\u{ff0c}\u{4e2d}\u{6587}\u{8f83}\u{591a}\u{65f6}\u{53ef}\u{9002}\u{5f53}\u{52a0}\u{5927}",
         "Scrollback lines" => "回滚行数",
         "Keepalive" => "保活",
 
@@ -433,9 +435,22 @@ fn zh(key: &'static str) -> &'static str {
         "Write the session to the log" => "\u{5c06}\u{4f1a}\u{8bdd}\u{5199}\u{5165}\u{65e5}\u{5fd7}",
         "Terminal colour scheme" => "\u{7ec8}\u{7aef}\u{914d}\u{8272}\u{65b9}\u{6848}",
         "New {0} session" => "\u{65b0}\u{5efa} {0} \u{4f1a}\u{8bdd}",
-        "\u{2715} Disconnect" => "\u{2715} \u{65ad}\u{5f00}\u{8fde}\u{63a5}",
         "\u{2315} Search sessions" => "\u{2315} \u{641c}\u{7d22}\u{4f1a}\u{8bdd}",
         "\u{2315} Filter by name" => "\u{2315} \u{6309}\u{540d}\u{79f0}\u{8fc7}\u{6ee4}",
+
+        // --- a delete the user has to confirm, and who wrote this ---------
+        "Delete this item?" =>
+            "\u{786e}\u{5b9a}\u{5220}\u{9664}\u{8be5}\u{6761}\u{76ee}\u{ff1f}",
+        "The file will be deleted. This cannot be undone." =>
+            "\u{8be5}\u{6587}\u{4ef6}\u{5c06}\u{88ab}\u{5220}\u{9664}\u{ff0c}\u{6b64}\u{64cd}\u{4f5c}\u{65e0}\u{6cd5}\u{64a4}\u{9500}\u{3002}",
+        "The folder and everything inside it will be deleted. This cannot be undone." =>
+            "\u{8be5}\u{6587}\u{4ef6}\u{5939}\u{53ca}\u{5176}\u{4e2d}\u{7684}\u{5168}\u{90e8}\u{5185}\u{5bb9}\u{90fd}\u{4f1a}\u{88ab}\u{5220}\u{9664}\u{ff0c}\u{6b64}\u{64cd}\u{4f5c}\u{65e0}\u{6cd5}\u{64a4}\u{9500}\u{3002}",
+        "Author: {0}" => "\u{4f5c}\u{8005}\u{ff1a}{0}",
+        "License: Apache License 2.0" =>
+            "\u{5f00}\u{6e90}\u{534f}\u{8bae}\u{ff1a}Apache License 2.0",
+        "Free to use, change and redistribute: see the LICENSE file for the full terms." =>
+            "\u{53ef}\u{81ea}\u{7531}\u{4f7f}\u{7528}\u{3001}\u{4fee}\u{6539}\u{4e0e}\u{518d}\u{5206}\u{53d1}\u{ff0c}\u{5b8c}\u{6574}\u{6761}\u{6b3e}\u{89c1} LICENSE \u{6587}\u{4ef6}\u{3002}",
+        "GitHub repository" => "GitHub \u{4ed3}\u{5e93}",
         _ => key,
     }
 }

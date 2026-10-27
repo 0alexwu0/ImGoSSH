@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 
 pub const APP_NAME: &str = "ImGoSSH";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Where the source lives: the about window shows it and the Help menu opens it.
+pub const REPOSITORY_URL: &str = "https://github.com/0alexwu0/ImGoSSH";
+/// Who wrote it, as the about window says.
+pub const APP_AUTHOR: &str = "Alex.Wu";
 
 /// Where settings live. `IMGOSSH_HOME` overrides it (handy for portable use).
 pub fn store_dir() -> PathBuf {
@@ -364,6 +368,9 @@ pub struct Config {
     pub palette: String,
     pub font_family: String,
     pub font_size: f32,
+    /// Row height as a multiple of the text box. Ideographs fill that box from
+    /// edge to edge, so the extra air is what keeps a page of Chinese from
+    /// reading as one solid band.
     pub line_spacing: f32,
     pub scrollback: usize,
     pub cursor_blink: bool,
@@ -406,7 +413,7 @@ impl Default for Config {
             // and the next complete face takes over.
             font_family: "Cascadia Mono".into(),
             font_size: 14.0,
-            line_spacing: 1.0,
+            line_spacing: 1.15,
             scrollback: 5000,
             cursor_blink: true,
             blink_ms: 500,

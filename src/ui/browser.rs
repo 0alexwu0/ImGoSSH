@@ -6,8 +6,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use egui::{CursorIcon, Pos2, Rect, RichText, Sense, Ui, Vec2};
-use egui_extras::{Column, TableBuilder};
+use egui::{Color32, CursorIcon, Pos2, Rect, RichText, Sense, Ui, Vec2};
+use egui_extras::{Column, TableBuilder, TableRow};
 use tokio::sync::mpsc;
 
 use crate::i18n::tr;
@@ -41,6 +41,13 @@ enum Prompt {
     NewFolder { local: bool },
     /// Rename `path` (remote or local).
     Rename { path: String, local: bool },
+}
+
+/// A row the delete button was pressed on, kept until the user says so.
+#[derive(Clone)]
+enum PendingDelete {
+    Remote(Entry),
+    Local(LocalEntry),
 }
 
 enum Loaded {
@@ -101,6 +108,8 @@ pub struct Browser {
     jobs: Vec<Tracked>,
     /// The properties window, while one is open.
     props: Option<Properties>,
+    /// A delete waiting for its confirmation.
+    pending_delete: Option<PendingDelete>,
     /// Something changed out of sight; each pane asks once.
     dirty_remote: bool,
     dirty_local: bool,
@@ -141,6 +150,7 @@ impl Browser {
             pane: Pane::Remote,
             jobs: Vec::new(),
             props: None,
+            pending_delete: None,
             dirty_remote: false,
             dirty_local: false,
             rx,
@@ -392,8 +402,8 @@ impl Browser {
         if self.jobs.is_empty() {
             return;
         }
-        let accent = theme::accent(ui);
-        let muted = theme::muted(ui);
+        let (good, _, bad, _) = theme::tones(ui);
+        let (accent, muted) = (theme::accent(ui), theme::muted(ui));
         let live: Vec<(Job, Progress)> = self
             .jobs
             .iter()
@@ -445,11 +455,20 @@ impl Browser {
             if cancel {
                 job.cancel();
             }
-            ui.add(
-                egui::ProgressBar::new(state.percent() / 100.0)
-                    .desired_height(13.0)
-                    .text(RichText::new(text).size(10.0))
-                    .fill(accent),
+            // The label rides on top of the bar rather than inside it, so the
+            // numbers stay readable while the fill runs underneath them.
+            let tone = match state.phase {
+                Phase::Done => good,
+                Phase::Failed(_) => bad,
+                Phase::Cancelled => muted,
+                _ => accent,
+            };
+            theme::meter(
+                ui,
+                state.percent() / 100.0,
+                ui.available_width(),
+                text,
+                tone,
             );
         }
         if rest > 0 {
@@ -643,25 +662,8 @@ impl Browser {
             }
         }
         if remote.remove {
-            if let (Some(conn), Some(entry)) = (
-                conn,
-                self.selected.and_then(|i| self.entries.get(i).cloned()),
-            ) {
-                let conn = conn.clone();
-                let tx = self.tx.clone();
-                tokio::spawn(async move {
-                    match conn.sftp().await {
-                        Ok(sftp) => {
-                            if let Err(err) = sftp::remove_all(&sftp, &entry).await {
-                                log::warn!("delete {}: {err}", entry.path);
-                            } else {
-                                let _ = tx.send(Loaded::Changed);
-                            }
-                        }
-                        Err(err) => log::warn!("delete failed: {err}"),
-                    }
-                });
-                self.selected = None;
+            if let Some(entry) = self.selected.and_then(|i| self.entries.get(i).cloned()) {
+                self.pending_delete = Some(PendingDelete::Remote(entry));
             }
         }
         if remote.rename {
@@ -711,8 +713,7 @@ impl Browser {
         }
         if local.remove {
             if let Some(entry) = self.local_selected.and_then(|i| self.local.get(i).cloned()) {
-                remove_local(&entry.path);
-                self.refresh_local();
+                self.pending_delete = Some(PendingDelete::Local(entry));
             }
         }
 
@@ -736,6 +737,7 @@ impl Browser {
         }
 
         self.prompt_dialog(ui, conn);
+        self.confirm_delete_ui(ui, conn);
         self.properties_dialog(ui, conn);
     }
 
@@ -912,6 +914,10 @@ impl Browser {
             .filter(|i| self.matches_filter(&self.entries[*i].name))
             .collect();
         let mut cmd = RemoteCmd::default();
+        // Walking out of a folder belongs in the list itself, not only on the
+        // toolbar above it. The root has no parent to offer.
+        let parent = crate::util::remote_parent(&self.path);
+        let can_up = connected && parent != self.path;
 
         let muted = theme::muted(ui);
         let head = |ui: &mut Ui, text: &str| {
@@ -942,6 +948,13 @@ impl Browser {
                 }
             })
             .body(|mut body| {
+                if can_up {
+                    body.row(23.0, |mut row| {
+                        if parent_row(&mut row, "remote-parent", show_time, muted) {
+                            cmd.navigate = Some(parent.clone());
+                        }
+                    });
+                }
                 for index in rows.iter().copied() {
                     body.row(23.0, |mut row| {
                         let entry = self.entries[index].clone();
@@ -1056,6 +1069,7 @@ impl Browser {
             .filter(|i| self.matches_filter(&self.local[*i].name))
             .collect();
         let mut cmd = LocalCmd::default();
+        let parent = self.local_path.parent().map(PathBuf::from);
 
         let muted = theme::muted(ui);
         let head = |ui: &mut Ui, text: &str| {
@@ -1083,6 +1097,13 @@ impl Browser {
                 }
             })
             .body(|mut body| {
+                if let Some(dir) = &parent {
+                    body.row(23.0, |mut row| {
+                        if parent_row(&mut row, "local-parent", show_time, muted) {
+                            cmd.open = Some(dir.clone());
+                        }
+                    });
+                }
                 for index in rows.iter().copied() {
                     body.row(23.0, |mut row| {
                         let entry = self.local[index].clone();
@@ -1174,6 +1195,110 @@ impl Browser {
         });
 
         cmd
+    }
+
+    /// The "are you sure" window behind every delete button.
+    ///
+    /// Deleting is the one thing in this pane nobody can undo, and a stray
+    /// click on the trash icon used to do it to a whole folder. The window
+    /// names the row and says how far the damage reaches.
+    fn confirm_delete_ui(&mut self, ui: &mut Ui, conn: Option<&Connection>) {
+        let Some(doomed) = self.pending_delete.clone() else {
+            return;
+        };
+        let (name, path, is_dir) = match &doomed {
+            PendingDelete::Remote(entry) => {
+                (entry.name.clone(), entry.path.clone(), entry.is_dir())
+            }
+            PendingDelete::Local(entry) => (
+                entry.name.clone(),
+                entry.path.to_string_lossy().into_owned(),
+                entry.is_dir,
+            ),
+        };
+        let (_, _, bad, _) = theme::tones(ui);
+        let mut decision: Option<bool> = None;
+        let mut open = true;
+        egui::Window::new(t!("Delete this item?"))
+            .id(egui::Id::new("browser-delete"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ui.ctx(), |ui| {
+                ui.set_width(340.0);
+                ui.label(RichText::new(name.as_str()).size(12.5).strong());
+                ui.label(
+                    RichText::new(path.as_str())
+                        .size(11.0)
+                        .monospace()
+                        .color(theme::muted(ui)),
+                );
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(if is_dir {
+                        t!(
+                            "The folder and everything inside it will be deleted. This cannot be undone."
+                        )
+                    } else {
+                        t!("The file will be deleted. This cannot be undone.")
+                    })
+                    .size(11.5)
+                    .color(bad),
+                );
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if theme::danger(ui, t!("Delete")).clicked() {
+                        decision = Some(true);
+                    }
+                    if ui.button(t!("Cancel")).clicked() {
+                        decision = Some(false);
+                    }
+                });
+            });
+        if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            decision = Some(false);
+        }
+
+        if let Some(yes) = decision {
+            self.pending_delete = None;
+            if yes {
+                self.delete(conn, &doomed);
+            }
+        } else if !open {
+            self.pending_delete = None;
+        }
+    }
+
+    /// Carry out a confirmed delete. The remote side answers on a later frame.
+    fn delete(&mut self, conn: Option<&Connection>, doomed: &PendingDelete) {
+        match doomed {
+            PendingDelete::Local(entry) => {
+                remove_local(&entry.path);
+                self.refresh_local();
+            }
+            PendingDelete::Remote(entry) => {
+                let Some(conn) = conn else {
+                    return;
+                };
+                let conn = conn.clone();
+                let entry = entry.clone();
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    match conn.sftp().await {
+                        Ok(sftp) => {
+                            if let Err(err) = sftp::remove_all(&sftp, &entry).await {
+                                log::warn!("delete {}: {err}", entry.path);
+                            } else {
+                                let _ = tx.send(Loaded::Changed);
+                            }
+                        }
+                        Err(err) => log::warn!("delete failed: {err}"),
+                    }
+                });
+                self.selected = None;
+            }
+        }
     }
 
     fn prompt_dialog(&mut self, ui: &mut Ui, conn: Option<&Connection>) {
@@ -1323,6 +1448,42 @@ fn cell(ui: &mut Ui, tag: &str, index: usize, draw: impl FnOnce(&mut Ui)) -> egu
     let response = ui.interact(rect, ui.id().with(("cell", tag, index)), Sense::click());
     draw(ui);
     response
+}
+
+/// The `..` row at the head of a listing: the folder one level up, in the same
+/// column as the files. Every other file browser offers it, and here it saves
+/// hunting for the up arrow on the toolbar above the path box.
+///
+/// It reports the request instead of navigating, so the caller keeps the
+/// history of its own pane.
+fn parent_row(row: &mut TableRow<'_, '_>, tag: &str, show_time: bool, muted: Color32) -> bool {
+    let mut up = false;
+    let mut hovered = false;
+    // Every column of the row answers to the pointer, so a click anywhere on
+    // the line means the same thing - not only the one under the folder glyph.
+    let mut grab = |ui: &mut Ui, text: &str, tip: bool| {
+        let rect = ui.available_rect_before_wrap();
+        let response = ui.interact(rect, ui.id().with(tag), Sense::click());
+        if !text.is_empty() {
+            ui.label(RichText::new(text).size(11.5).color(muted));
+        }
+        let response = if tip {
+            response
+                .on_hover_cursor(CursorIcon::PointingHand)
+                .on_hover_text(t!("Parent folder"))
+        } else {
+            response
+        };
+        hovered |= response.hovered();
+        up |= response.clicked();
+    };
+    row.col(|ui| grab(ui, "\u{1f4c1} \u{2026}", true));
+    row.col(|ui| grab(ui, "--", false));
+    if show_time {
+        row.col(|ui| grab(ui, "", false));
+    }
+    row.set_hovered(hovered);
+    up
 }
 
 /// The row a remote menu was opened on, as the properties window's first draft.

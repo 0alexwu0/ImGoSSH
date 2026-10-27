@@ -85,6 +85,9 @@ pub struct State {
 pub struct Style<'a> {
     pub font: FontId,
     pub cell: Vec2,
+    /// Air `line_spacing` adds to a row, shared between its top and its bottom.
+    /// Zero leaves a row exactly as tight as the glyphs that fill it.
+    pub leading: f32,
     pub palette: &'a Palette,
     /// Cursor phase, driven by the blink timer.
     pub cursor_on: bool,
@@ -295,6 +298,10 @@ fn paint(
     let default_fg = rgb(style.palette.foreground);
     let selection_bg = rgb(style.palette.selection);
     let cell = style.cell;
+    // A row may be taller than the text in it. The glyphs keep their own
+    // height and take the middle of the band, so leading lands half above and
+    // half below rather than all of it under the baseline.
+    let inset = style.leading * 0.5;
     let screen = term.screen();
     let mut cells: Vec<(char, u16)> = Vec::new();
 
@@ -348,7 +355,11 @@ fn paint(
                 painter.rect_filled(box_rect, 0.0, run.bg);
             }
             if run.underline {
-                painter.hline(x..=x + width, y + cell.y - 1.5, Stroke::new(1.0, run.fg));
+                painter.hline(
+                    x..=x + width,
+                    y + cell.y - inset - 1.5,
+                    Stroke::new(1.0, run.fg),
+                );
             }
 
             let font_id = style.font.clone();
@@ -376,7 +387,7 @@ fn paint(
 
         if !job.text.is_empty() {
             let galley = painter.layout_job(job);
-            painter.galley(Pos2::new(rect.min.x, y), galley, default_fg);
+            painter.galley(Pos2::new(rect.min.x, y + inset), galley, default_fg);
         }
     }
 
@@ -999,6 +1010,7 @@ mod tests {
         let style = Style {
             font: FontId::monospace(14.0),
             cell,
+            leading: 0.0,
             palette: &palette,
             cursor_on: false,
             pad: 0.0,
@@ -1075,6 +1087,7 @@ mod tests {
             let style = Style {
                 font: FontId::monospace(12.0),
                 cell: Vec2::new(8.0, 16.0),
+                leading: 0.0,
                 palette: &palette,
                 cursor_on: true,
                 pad: 0.0,
