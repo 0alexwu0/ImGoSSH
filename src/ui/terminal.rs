@@ -2,12 +2,13 @@
 //! bytes. Transport agnostic - the same widget drives SSH shells and local
 //! pseudo-consoles.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Color32, EventFilter, FontId, Modifiers, Painter, Pos2, Rect, Sense, Stroke, StrokeKind, Ui,
-    Vec2,
+    Color32, Context, EventFilter, FontId, Modifiers, Painter, Pos2, Rect, Sense, Stroke,
+    StrokeKind, Ui, Vec2,
 };
 use vt100::{Color, MouseProtocolMode};
 
@@ -75,6 +76,9 @@ pub struct State {
     /// Ask the grid for the keyboard as soon as it is drawn again, used to
     /// hand focus back after the right-click menu ate the click.
     pub want_focus: bool,
+    /// Expected glyph advances, kept so that every cell can be dropped back
+    /// onto its own column.
+    guesses: Guesses,
 }
 
 /// Colours and metrics for one frame.
@@ -188,12 +192,99 @@ struct Run {
     selected: bool,
 }
 
+/// How far a group of cells may be laid out before the pen is snapped back onto
+/// the grid, in points.
+const MAX_DRIFT: f32 = 0.25;
+
+/// The advance each character is expected to cost, in points.
+///
+/// Only the tables inside the font know that, and a character the terminal face
+/// does not own is not in them: it comes from a fallback face, or from the box
+/// egui paints when no face has it at all. A guess is good enough to decide where
+/// a group of cells ends, which is all it is used for - the width a group actually
+/// takes is measured before the pen moves on.
+#[derive(Default)]
+struct Guesses {
+    size: f32,
+    advances: HashMap<char, f32>,
+}
+
+impl Guesses {
+    /// The advance `ch` is expected to cost at `font.size`, looked up once.
+    fn guess(&mut self, ctx: &Context, font: &FontId, ch: char) -> f32 {
+        if self.size != font.size {
+            self.size = font.size;
+            self.advances.clear();
+        }
+        if let Some(advance) = self.advances.get(&ch) {
+            return *advance;
+        }
+        let advance = ctx.fonts_mut(|fonts| fonts.glyph_width(font, ch));
+        self.advances.insert(ch, advance);
+        advance
+    }
+}
+
+/// Append one run of cells, closing a group as soon as the glyphs drift off the
+/// grid so that a wide fallback glyph, or a missing one, cannot take the rest of
+/// the row with it.
+fn append_cells(
+    job: &mut LayoutJob,
+    guesses: &mut Guesses,
+    ctx: &Context,
+    font: &FontId,
+    cell_x: f32,
+    cells: &[(char, u16)],
+    format: TextFormat,
+) {
+    let mut text = String::new();
+    let mut guessed = 0.0;
+    let mut allotted = 0.0;
+    for &(ch, count) in cells {
+        let advance = guesses.guess(ctx, font, ch);
+        let budget = cell_x * f32::from(count);
+        // Nothing is known about a character the tables have no advance for.
+        let unknown = advance <= 0.0;
+        if !text.is_empty()
+            && (unknown || (guessed + advance - allotted - budget).abs() > MAX_DRIFT)
+        {
+            close_group(job, ctx, &text, allotted, &format);
+            text.clear();
+            guessed = 0.0;
+            allotted = 0.0;
+        }
+        text.push(ch);
+        guessed += advance.max(0.0);
+        allotted += budget;
+        if unknown {
+            close_group(job, ctx, &text, allotted, &format);
+            text.clear();
+            guessed = 0.0;
+            allotted = 0.0;
+        }
+    }
+    if !text.is_empty() {
+        close_group(job, ctx, &text, allotted, &format);
+    }
+}
+
+/// Lay `text` out once to learn how wide it really is, then append it with just
+/// enough space in front of its neighbour to leave the pen on a cell boundary.
+fn close_group(job: &mut LayoutJob, ctx: &Context, text: &str, allotted: f32, format: &TextFormat) {
+    let mut measured = LayoutJob::default();
+    measured.append(text, 0.0, format.clone());
+    let width = ctx.fonts_mut(|fonts| fonts.layout_job(measured)).size().x;
+    job.append(text, allotted - width, format.clone());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint(
     painter: &Painter,
+    ctx: &Context,
     rect: Rect,
     term: &Emulator,
     style: &Style<'_>,
+    guesses: &mut Guesses,
     selection: Option<Selection>,
     rows: u16,
     cols: u16,
@@ -205,6 +296,7 @@ fn paint(
     let selection_bg = rgb(style.palette.selection);
     let cell = style.cell;
     let screen = term.screen();
+    let mut cells: Vec<(char, u16)> = Vec::new();
 
     for row in 0..rows {
         let y = rect.min.y + row as f32 * cell.y;
@@ -217,7 +309,7 @@ fn paint(
             };
             let run = run_style(first, style.palette, selection, row, col);
             let start = col;
-            let mut text = String::new();
+            cells.clear();
             while col < cols {
                 let Some(c) = screen.cell(row, col) else {
                     break;
@@ -230,13 +322,20 @@ fn paint(
                 if run_style(c, style.palette, selection, row, col) != run {
                     break;
                 }
+                // A wide glyph owns its own cell and the one that follows it.
+                let wide = col.checked_add(1).is_some_and(|next| {
+                    screen
+                        .cell(row, next)
+                        .is_some_and(|following| following.is_wide_continuation())
+                });
+                let count = if wide { 2 } else { 1 };
                 match c.contents().chars().next() {
-                    Some(ch) => text.push(ch),
-                    None => text.push(' '),
+                    Some(ch) => cells.push((ch, count)),
+                    None => cells.push((' ', count)),
                 }
-                col += 1;
+                col += count;
             }
-            if text.is_empty() {
+            if cells.is_empty() {
                 continue;
             }
 
@@ -259,9 +358,13 @@ fn paint(
             } else {
                 color
             };
-            job.append(
-                &text,
-                0.0,
+            append_cells(
+                &mut job,
+                guesses,
+                ctx,
+                &style.font,
+                cell.x,
+                &cells,
                 TextFormat {
                     font_id,
                     color,
@@ -394,9 +497,11 @@ pub fn show(
         let term = emu.lock().unwrap();
         paint(
             &ui.painter_at(rect),
+            ui.ctx(),
             well,
             &term,
             style,
+            &mut st.guesses,
             st.selection,
             rows,
             cols,
@@ -806,6 +911,131 @@ pub const RELEASE: u16 = MOUSE_RELEASE;
 mod tests {
     use super::*;
 
+    // Every cell has to land on its own column. A character the terminal face
+    // cannot paint arrives from a fallback face with a different advance, and left
+    // to itself that glyph drags the rest of the row sideways with it.
+    #[test]
+    fn a_fallback_glyph_leaves_the_grid_where_it_is() {
+        let ctx = egui::Context::default();
+        // The font atlas only exists once a pass has begun.
+        ctx.begin_pass(egui::RawInput::default());
+        let font = FontId::monospace(14.0);
+        let cell = ctx.fonts_mut(|fonts| fonts.glyph_width(&font, 'M'));
+        assert!(cell > 0.0, "the test needs a font to measure");
+
+        // A grinning face is in none of the text faces, so an emoji fallback
+        // paints it - at an advance nothing like the terminal's.
+        let cells = [('a', 1), ('\u{1f600}', 1), ('b', 1)];
+        let mut job = LayoutJob::default();
+        let mut guesses = Guesses::default();
+        append_cells(
+            &mut job,
+            &mut guesses,
+            &ctx,
+            &font,
+            cell,
+            &cells,
+            TextFormat::default(),
+        );
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        let last = galley.rows[0]
+            .glyphs
+            .last()
+            .expect("the run should have painted");
+        assert!(
+            (last.pos.x - 2.0 * cell).abs() < 0.5,
+            "the third cell drifted to {} instead of {}",
+            last.pos.x,
+            2.0 * cell
+        );
+    }
+
+    /// Text the face can paint on its own stays one run: snapping a grid that
+    /// already lines up would only buy layout work.
+    #[test]
+    fn text_that_already_lines_up_stays_one_run() {
+        let ctx = egui::Context::default();
+        // The font atlas only exists once a pass has begun.
+        ctx.begin_pass(egui::RawInput::default());
+        let font = FontId::monospace(14.0);
+        let cell = ctx.fonts_mut(|fonts| fonts.glyph_width(&font, 'M'));
+        let cells: Vec<(char, u16)> = "docker compose up".chars().map(|ch| (ch, 1)).collect();
+        let mut job = LayoutJob::default();
+        let mut guesses = Guesses::default();
+        append_cells(
+            &mut job,
+            &mut guesses,
+            &ctx,
+            &font,
+            cell,
+            &cells,
+            TextFormat::default(),
+        );
+        assert_eq!(job.sections.len(), 1, "an aligned run must not split");
+    }
+
+    // One glyph from a fallback face used to drag every cell after it off its
+    // column, which is how a box painted by a monitoring program ends up torn
+    // apart. Whatever a font does with a glyph, it has to start on a boundary.
+    #[test]
+    fn every_glyph_lands_on_a_cell_column() {
+        let emu = Arc::new(Mutex::new(Emulator::new(3, 60, 0)));
+        let backend = Arc::new(Mutex::new(None));
+        let palette = Palette::default();
+        let cell = Vec2::new(8.0, 16.0);
+        // Box drawing, the shades and the eighth blocks a bar is drawn from,
+        // braille, and one ideograph: egui's own faces hold none of these.
+        let art = ("\u{250c}\u{2500}\u{2500} Speed \u{2500}\u{2510}\u{2591}\u{2592}\u{2593}\u{2588}\u{2581}\u{2800}\u{7528} tail\u{0d}\u{0a}").repeat(3);
+        emu.lock().unwrap().feed(art.as_bytes());
+
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let style = Style {
+            font: FontId::monospace(14.0),
+            cell,
+            palette: &palette,
+            cursor_on: false,
+            pad: 0.0,
+            radius: 0.0,
+            border: Color32::TRANSPARENT,
+        };
+        let mut st = State::default();
+        let mut output = ctx.run_ui(raw, |ui| {
+            let _ = show(ui, &emu, &backend, &mut st, &style, false);
+        });
+        // There is no renderer here to apply the font texture to.
+        output.textures_delta.clear();
+
+        let mut columns: Vec<f32> = Vec::new();
+        for clipped in &output.shapes {
+            let egui::Shape::Text(painted) = &clipped.shape else {
+                continue;
+            };
+            for row in &painted.galley.rows {
+                for glyph in &row.glyphs {
+                    columns.push(painted.pos.x + glyph.pos.x);
+                }
+            }
+        }
+        assert!(columns.len() > 60, "the grid painted nothing to check");
+        let left = columns.iter().cloned().fold(f32::INFINITY, f32::min);
+        for x in columns {
+            let drift = (x - left).rem_euclid(cell.x);
+            // egui lands a glyph on a whole pixel, so a column can sit a pixel off
+            // its neighbour; anything wider than that has slid out of its cell.
+            assert!(
+                drift.min(cell.x - drift) < 1.5,
+                "a glyph sits {} points off its column",
+                drift.min(cell.x - drift)
+            );
+        }
+    }
     // A click on the right-click menu lands inside the grid rect as far as raw
     // pointer input is concerned, and must not be read as a click on a cell -
     // that would collapse the selection the menu is about to copy.

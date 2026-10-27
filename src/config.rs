@@ -401,7 +401,10 @@ impl Default for Config {
             language: "auto".into(),
             theme: Theme::ImGo,
             palette: "ImGo Dark".into(),
-            font_family: "Consolas".into(),
+            // Whatever the platform, this is the family whose face covers the
+            // whole terminal grid; a machine without it is detected at startup
+            // and the next complete face takes over.
+            font_family: "Cascadia Mono".into(),
             font_size: 14.0,
             line_spacing: 1.0,
             scrollback: 5000,

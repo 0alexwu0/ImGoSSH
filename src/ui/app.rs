@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use egui::epaint;
 use egui::{
     Align2, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily,
     FontId, FontTweak, Margin, Pos2, Rect, Response, Sense, StrokeKind, Ui, Vec2,
@@ -150,10 +151,6 @@ pub struct App {
     term_menu_fresh: bool,
     cell: Vec2,
     font: FontId,
-    /// Installed font definitions, kept so the CJK scale can be tuned later.
-    fonts: FontDefinitions,
-    cjk_font: Option<&'static str>,
-    fonts_tuned: bool,
     cursor_on: bool,
     blink_at: f64,
 
@@ -172,7 +169,7 @@ impl App {
         i18n::set(resolve_lang(&store.config.language));
         let palette = store.config.palette();
         let font = FontId::monospace(store.config.font_size);
-        let (fonts, cjk_font) = setup_fonts(cc, &store.config.font_family);
+        setup_fonts(cc, &store.config.font_family, store.config.font_size);
         // The font atlas only exists after the first `Context::run`, so the
         // cell metrics are measured on the first frame instead of here.
         let cell = Vec2::ZERO;
@@ -207,9 +204,6 @@ impl App {
             term_menu_fresh: false,
             cell,
             font,
-            fonts,
-            cjk_font,
-            fonts_tuned: false,
             cursor_on: true,
             blink_at: 0.0,
 
@@ -517,51 +511,178 @@ fn non_empty(text: &str) -> Option<String> {
 // Fonts, metrics and theme
 // ---------------------------------------------------------------------------
 
-/// Try to use a real terminal font from the system, fall back to egui's Hack.
-fn setup_fonts(
-    cc: &eframe::CreationContext<'_>,
-    family: &str,
-) -> (FontDefinitions, Option<&'static str>) {
+/// The ranges a terminal grid is painted from.
+///
+/// A face that lacks one of them hands that cell to a fallback whose advance
+/// matches the terminal's only by luck, and everything right of it slides along
+/// the row. The Consolas that ships with Windows has no eighth blocks and no
+/// braille at all, which is enough to tear apart the boxes and bars a
+/// monitoring program paints.
+const GRID_RANGES: [(u32, u32); 5] = [
+    (0x2500, 0x257F), // box drawing: the panels every dashboard is built from
+    (0x2580, 0x259F), // blocks, eighths and shades: bars and sparklines
+    (0x25A0, 0x25DF), // geometric shapes: bullets, triangles, quadrants
+    (0x2190, 0x2193), // the arrows a status line points with
+    (0x2800, 0x28FF), // braille: what btop and friends chart with
+];
+
+/// The grid characters outside those ranges: the middle dot, degree sign and
+/// plus-minus sign that the DEC special graphics set stands in for.
+const GRID_STRAYS: [char; 3] = ['\u{00b7}', '\u{00b0}', '\u{00b1}'];
+
+/// Terminal fonts to try, the most complete first.
+///
+/// Cascadia Mono ships with Windows Terminal and covers the grid on its own, as
+/// do Menlo on macOS and the DejaVu family on Linux. Consolas comes last: it is
+/// on every Windows, but it is not a complete terminal face.
+const TERMINAL_FONTS: [(&str, &str); 9] = [
+    ("Cascadia Mono", r"C:\Windows\Fonts\CascadiaMono.ttf"),
+    ("Cascadia Code", r"C:\Windows\Fonts\CascadiaCode.ttf"),
+    ("Menlo", "/System/Library/Fonts/Menlo.ttc"),
+    ("SF Mono", "/System/Library/Fonts/SFMono-Regular.otf"),
+    (
+        "DejaVu Sans Mono",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    ),
+    (
+        "Liberation Mono",
+        "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
+    ),
+    (
+        "Noto Sans Mono",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    ),
+    (
+        "Ubuntu Mono",
+        "/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+    ),
+    ("Consolas", r"C:\Windows\Fonts\consola.ttf"),
+];
+
+/// Build the font table: one monospace face that owns the whole grid, then the
+/// symbol and East Asian fallbacks, then hand the lot to egui.
+fn setup_fonts(cc: &eframe::CreationContext<'_>, family: &str, size: f32) {
     let mut fonts = FontDefinitions::default();
-    let candidates: [(&str, &str); 5] = [
-        ("Consolas", r"C:\Windows\Fonts\consola.ttf"),
-        ("Cascadia Mono", r"C:\Windows\Fonts\CascadiaMono.ttf"),
-        ("Menlo", "/System/Library/Fonts/Menlo.ttc"),
-        (
-            "DejaVu Sans Mono",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        ),
-        (
-            "Liberation Mono",
-            "/usr/share/fonts/liberation-mono/LiberationMono-Regular.ttf",
-        ),
-    ];
-    let wanted = family.to_lowercase();
-    let chosen = candidates
-        .iter()
-        .find(|(name, _)| name.to_lowercase() == wanted)
-        .or_else(|| {
-            candidates
-                .iter()
-                .find(|(_, path)| std::path::Path::new(path).exists())
-        });
-    if let Some((name, path)) = chosen {
-        if let Ok(bytes) = std::fs::read(path) {
-            let data = FontData::from_owned(bytes);
-            fonts.font_data.insert(name.to_string(), Arc::new(data));
-            let list = fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_insert_with(Vec::new);
-            if !list.iter().any(|f| f == name) {
-                list.insert(0, name.to_string());
-            }
-        }
-    }
+    install_terminal_font(&mut fonts, family);
     add_symbol_fallback(&mut fonts);
-    let cjk = add_cjk_fallback(&mut fonts);
-    cc.egui_ctx.set_fonts(fonts.clone());
-    (fonts, cjk)
+    if let Some(cjk) = add_cjk_fallback(&mut fonts) {
+        tune_cjk_scale(&mut fonts, cjk, size);
+    }
+    cc.egui_ctx.set_fonts(fonts);
+}
+
+/// Put the first complete monospace face at the head of the terminal family.
+///
+/// The family named in `config.toml` is tried first, then the candidates in
+/// coverage order; a face that has to borrow any grid glyph from a fallback
+/// gives way to the next one. When nothing installed covers the grid, egui's own
+/// embedded Hack heads the family: it needs no file, and its metrics are the
+/// same on every machine, which is what a grid wants.
+fn install_terminal_font(fonts: &mut FontDefinitions, family: &str) {
+    let wanted = family.trim().to_lowercase();
+    let preferred = TERMINAL_FONTS
+        .iter()
+        .find(|(name, _)| name.to_lowercase() == wanted);
+    if !wanted.is_empty() && preferred.is_none() {
+        log::info!("no font file for {wanted} among the terminal candidates");
+    }
+    let ordered = preferred.into_iter().chain(
+        TERMINAL_FONTS
+            .iter()
+            .filter(move |face| Some(*face) != preferred),
+    );
+    let needed = grid_glyphs().len();
+    for face in ordered {
+        let (name, path) = *face;
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let data = FontData::from_owned(bytes);
+        let covered = grid_coverage(name, &data);
+        if covered < needed {
+            let missing = needed - covered;
+            // The family named in `config.toml` leads the queue, but it only gets
+            // the grid if it can actually paint one - honouring an incomplete face
+            // is what tears the layout apart - so say out loud why it was passed
+            // over rather than leaving it to a debug line nobody enables.
+            let level = if Some(face) == preferred {
+                log::Level::Info
+            } else {
+                log::Level::Debug
+            };
+            log::log!(
+                level,
+                "{name} is missing {missing} of the {needed} grid glyphs"
+            );
+            continue;
+        }
+        fonts.font_data.insert(name.to_string(), Arc::new(data));
+        let list = fonts.families.entry(FontFamily::Monospace).or_default();
+        if !list.iter().any(|face| face.as_str() == name) {
+            list.insert(0, name.to_string());
+        }
+        log::info!("terminal font: {name}");
+        return;
+    }
+    log::info!("terminal font: Hack (embedded)");
+}
+
+/// Every character a terminal grid is painted from.
+fn grid_glyphs() -> Vec<char> {
+    GRID_RANGES
+        .iter()
+        .flat_map(|(first, last)| *first..=*last)
+        .filter_map(char::from_u32)
+        .chain(GRID_STRAYS)
+        .collect()
+}
+
+/// The size the coverage probe measures a glyph at, in points.
+const PROBE_SIZE: f32 = 16.0;
+
+/// How many grid characters `data` paints on its own, with no fallback to lean
+/// on. A face that has to borrow a glyph charges nothing for it, so a nonzero
+/// advance is what "this face owns this cell" means.
+///
+/// `FontsView::has_glyph` cannot say. It answers by comparing the face holding
+/// the glyph against the face holding the replacement glyph, and a family built
+/// from a single face only ever has the second: every glyph the face can paint
+/// comes back reported as missing, which once left the terminal on its embedded
+/// fallback no matter what was installed.
+///
+/// A private atlas stands in for the one egui builds, because
+/// `Context::set_fonts` only takes effect at the start of the next pass and
+/// this has to be settled before the first frame is laid out.
+fn grid_coverage(name: &str, data: &FontData) -> usize {
+    let mut definitions = FontDefinitions::default();
+    definitions.font_data.clear();
+    definitions.families.clear();
+    definitions
+        .font_data
+        .insert(name.to_string(), Arc::new(data.clone()));
+    definitions
+        .families
+        .insert(FontFamily::Monospace, vec![name.to_string()]);
+    let glyphs = grid_glyphs();
+    let font = FontId::monospace(PROBE_SIZE);
+    measure(&definitions, |fonts| {
+        glyphs
+            .iter()
+            .filter(|ch| fonts.glyph_width(&font, **ch) > 0.0)
+            .count()
+    })
+}
+
+/// Run `probe` against a throwaway font atlas built from `definitions`.
+fn measure<T>(definitions: &FontDefinitions, probe: impl FnOnce(&mut epaint::FontsView) -> T) -> T {
+    let mut atlas = epaint::Fonts::new(epaint::TextOptions::default(), definitions.clone());
+    probe(&mut atlas.with_pixels_per_point(1.0))
+}
+
+/// The width one character has in `definitions`, in points.
+fn advance(definitions: &FontDefinitions, ch: char, size: f32) -> f32 {
+    let font = FontId::monospace(size);
+    measure(definitions, |fonts| fonts.glyph_width(&font, ch))
 }
 
 /// egui's bundled proportional font has no arrows, triangles or dingbats, so
@@ -598,30 +719,29 @@ fn add_cjk_fallback(fonts: &mut FontDefinitions) -> Option<&'static str> {
 }
 
 /// Scale the East Asian fallback so one ideograph is exactly two terminal cells
-/// wide. Measuring needs a live font atlas, so this runs on the first frame.
-fn tune_cjk_scale(ctx: &Context, fonts: &mut FontDefinitions, name: &str) {
-    let size = 32.0;
-    ctx.set_fonts(fonts.clone());
-    let latin = glyph_advance(ctx, "M", size);
+/// wide. The Latin side comes from the terminal face that now heads the family,
+/// so both are measured on one scale.
+fn tune_cjk_scale(fonts: &mut FontDefinitions, name: &str, size: f32) {
+    let latin = advance(fonts, 'M', size);
 
     let mut probe = fonts.clone();
     probe
         .families
         .insert(FontFamily::Monospace, vec![name.to_string()]);
-    ctx.set_fonts(probe);
-    let cjk = glyph_advance(ctx, "\u{7528}", size);
+    let cjk = advance(&probe, '\u{7528}', size);
 
-    if latin > 0.0 && cjk > 0.0 {
-        if let Some(current) = fonts.font_data.get(name) {
-            let mut tweaked = (**current).clone();
-            tweaked.tweak = FontTweak {
-                scale: (2.0 * latin) / cjk,
-                ..Default::default()
-            };
-            fonts.font_data.insert(name.to_string(), Arc::new(tweaked));
-        }
+    if latin <= 0.0 || cjk <= 0.0 {
+        return;
     }
-    ctx.set_fonts(fonts.clone());
+    let Some(current) = fonts.font_data.get(name) else {
+        return;
+    };
+    let mut tweaked = (**current).clone();
+    tweaked.tweak = FontTweak {
+        scale: (2.0 * latin) / cjk,
+        ..Default::default()
+    };
+    fonts.font_data.insert(name.to_string(), Arc::new(tweaked));
 }
 
 /// Load the first font that exists and queue it behind the UI fonts.
@@ -655,21 +775,17 @@ fn install_fallback(
     Some(name)
 }
 
-fn glyph_advance(ctx: &Context, text: &str, size: f32) -> f32 {
-    ctx.fonts_mut(|fonts| {
-        fonts
-            .layout_no_wrap(text.to_string(), FontId::monospace(size), Color32::WHITE)
-            .size()
-            .x
-    })
-}
 /// Width and height of one character cell, in points.
 fn measure_cell(ctx: &Context, font: &FontId) -> Vec2 {
+    // The advance and nothing else: every column is placed from this number, so
+    // it has to be the width the shaper itself charges for a glyph.
+    let advance = ctx.fonts_mut(|fonts| fonts.glyph_width(font, 'M'));
     let galley =
         ctx.fonts_mut(|fonts| fonts.layout_no_wrap("M".to_string(), font.clone(), Color32::WHITE));
     let size = galley.size();
-    if size.x > 0.0 && size.y > 0.0 {
-        Vec2::new(size.x, size.y)
+    let width = if advance > 0.0 { advance } else { size.x };
+    if width > 0.0 && size.y > 0.0 {
+        Vec2::new(width, size.y)
     } else {
         Vec2::new(8.0, 16.0)
     }
@@ -721,12 +837,6 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ctx = Some(ctx.clone());
-        if !self.fonts_tuned {
-            self.fonts_tuned = true;
-            if let Some(name) = self.cjk_font {
-                tune_cjk_scale(ctx, &mut self.fonts, name);
-            }
-        }
         self.apply_theme(ctx);
         self.poll_prompts();
         self.poll_connections();
@@ -2483,6 +2593,43 @@ fn menu_is_dismissed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The coverage probe is the whole basis for choosing a face, so it has to see
+    // the glyphs a face does own. Asking `has_glyph` instead reported none of
+    // them, which quietly left the terminal on the embedded fallback no matter
+    // what a machine had installed.
+    #[test]
+    fn the_coverage_probe_sees_the_glyphs_a_face_owns() {
+        // egui's own face ships with the binary, so this says nothing about
+        // whatever fonts the machine running the test happens to have.
+        let embedded = FontDefinitions::default();
+        let hack = &embedded.font_data["Hack"];
+        let covered = grid_coverage("Hack", hack);
+        assert!(covered > 0, "the probe sees no glyph in the embedded face");
+        assert!(
+            covered < grid_glyphs().len(),
+            "the probe claims the embedded face paints every grid glyph"
+        );
+    }
+
+    /// A terminal face that has to borrow grid glyphs from a fallback paints
+    /// them at another advance, and the columns drift. Either the face covers the
+    /// whole grid, or egui's own embedded one - which is the same on every machine
+    /// - is left to paint it.
+    #[test]
+    fn the_terminal_font_covers_the_grid_or_defers_to_the_embedded_one() {
+        let mut fonts = FontDefinitions::default();
+        install_terminal_font(&mut fonts, "");
+        let head = fonts.families[&FontFamily::Monospace]
+            .first()
+            .cloned()
+            .expect("the monospace family must not be empty");
+        let covered = grid_coverage(&head, &fonts.font_data[&head]) == grid_glyphs().len();
+        assert!(
+            covered || head == "Hack",
+            "{head} cannot paint the terminal grid"
+        );
+    }
 
     fn mods(ctrl: bool, shift: bool, alt: bool) -> egui::Modifiers {
         egui::Modifiers {
