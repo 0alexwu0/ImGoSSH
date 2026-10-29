@@ -336,6 +336,35 @@ impl Palette {
                 selection: [0xb3, 0xd7, 0xf7],
                 ansi: base,
             },
+            // The neutral charcoal of a classic Windows console: a flat grey
+            // ground and a near-white ink, which is what makes a wall of small
+            // Latin text read as crisp rather than as a tint. The hues are the
+            // ones a dark ground wants, with the brights held clear of the
+            // normals so a bold prompt still stands out from a plain one.
+            "Charcoal" => Palette {
+                foreground: [0xec, 0xec, 0xec],
+                background: [0x1c, 0x1c, 0x1c],
+                cursor: [0xd0, 0xd0, 0xd0],
+                selection: [0x2f, 0x46, 0x5c],
+                ansi: [
+                    [0x28, 0x2c, 0x34],
+                    [0xe0, 0x6c, 0x75],
+                    [0x98, 0xc3, 0x79],
+                    [0xe5, 0xc0, 0x7b],
+                    [0x61, 0xaf, 0xef],
+                    [0xc6, 0x78, 0xdd],
+                    [0x56, 0xb6, 0xc2],
+                    [0xdc, 0xdf, 0xe4],
+                    [0x5c, 0x63, 0x70],
+                    [0xff, 0x7f, 0x89],
+                    [0xa5, 0xd6, 0x8a],
+                    [0xf0, 0xcf, 0x8a],
+                    [0x7c, 0xbc, 0xfc],
+                    [0xd7, 0x9a, 0xe8],
+                    [0x4b, 0xc8, 0xdc],
+                    [0xff, 0xff, 0xff],
+                ],
+            },
             _ => Palette {
                 foreground: [0xd5, 0xd8, 0xdc],
                 background: [0x14, 0x17, 0x1a],
@@ -346,8 +375,8 @@ impl Palette {
         }
     }
 
-    pub fn names() -> [&'static str; 3] {
-        ["ImGo Dark", "ImGo Light", "Xterm"]
+    pub fn names() -> [&'static str; 4] {
+        ["ImGo Dark", "Charcoal", "ImGo Light", "Xterm"]
     }
 }
 

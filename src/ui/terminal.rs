@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use egui::text::{LayoutJob, TextFormat};
 use egui::{
-    Color32, Context, EventFilter, FontId, Modifiers, Painter, Pos2, Rect, Sense, Stroke,
-    StrokeKind, Ui, Vec2,
+    Align, Color32, Context, CursorIcon, EventFilter, FontId, Layout, Modifiers, Painter, Pos2,
+    Rect, RichText, Sense, Stroke, StrokeKind, Ui, UiBuilder, Vec2,
 };
 use vt100::{Color, MouseProtocolMode};
 
@@ -108,6 +108,8 @@ pub struct Output {
     pub copy: Option<String>,
     /// Where to open the right-click menu.
     pub menu_at: Option<Pos2>,
+    /// The notice asked for the session to be started again.
+    pub restart: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -440,11 +442,32 @@ fn run_style(
 // Widget
 // ---------------------------------------------------------------------------
 
+/// The strip a finished session is announced in, in points.
+const STRIP: f32 = 30.0;
+
+/// What a terminal says about a session that is no longer running.
+///
+/// A grid that only stops moving is easily mistaken for one that is still
+/// thinking, so a dead session gets the bottom of the well to say so in, and
+/// the button that starts the whole thing over.
+pub struct Notice {
+    /// Why the session is over: drawn in `tone`.
+    pub text: String,
+    /// Label of the button that opens the session again.
+    pub action: Option<String>,
+    /// The colour of the message: grey for a clean exit, red for a failure.
+    pub tone: Color32,
+}
+
 /// Draw one terminal and read its input.
 ///
 /// `menu_open` tells the grid that its right-click menu is up. The menu
 /// floats over the cells, and a click on it must not be read as a click on a
 /// cell - that would collapse the very selection the menu is about to copy.
+///
+/// `notice` is what the owner of the session wants said about it no longer
+/// running. It gets the bottom strip of the well, and its button comes back as
+/// [`Output::restart`].
 pub fn show(
     ui: &mut Ui,
     emu: &Arc<Mutex<Emulator>>,
@@ -452,11 +475,20 @@ pub fn show(
     st: &mut State,
     style: &Style<'_>,
     menu_open: bool,
+    notice: Option<&Notice>,
 ) -> Output {
     let mut out = Output::default();
 
     // ---- geometry -------------------------------------------------------
-    let available = ui.available_size_before_wrap() - Vec2::splat(2.0 * style.pad);
+    // A session that is over gets the bottom of the well to say so in. The strip
+    // comes off the grid rather than being painted over it: a reason with a row
+    // of glyphs through it is worth less than a row of scrollback. A window too
+    // short to spare one is a window with the notice left out rather than one
+    // whose grid is squeezed to nothing.
+    let room = ui.available_size_before_wrap();
+    let notice = notice.filter(|_| room.y > 5.0 * STRIP);
+    let strip = if notice.is_some() { STRIP } else { 0.0 };
+    let available = room - Vec2::new(2.0 * style.pad, 2.0 * style.pad + strip);
     let (want_cols, want_rows) = fit(available, style.cell);
     let (rows, cols) = {
         let mut term = emu.lock().unwrap();
@@ -470,7 +502,7 @@ pub fn show(
     let size = Vec2::new(
         grid.x.min(available.x).max(style.cell.x),
         grid.y.min(available.y).max(style.cell.y),
-    ) + Vec2::splat(2.0 * style.pad);
+    ) + Vec2::new(2.0 * style.pad, 2.0 * style.pad + strip);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let focused = response.has_focus();
     // The cells live inside a rounded well: the padding keeps the first column
@@ -479,6 +511,11 @@ pub fn show(
         rect.min + Vec2::splat(style.pad),
         rect.size() - Vec2::splat(2.0 * style.pad),
     );
+    // The notice takes the last `strip` points of the well and the cells stop
+    // above it, so a pointer reaching for the button cannot select a cell that
+    // is no longer there. The wheel still scrolls from anywhere in the widget,
+    // notice included.
+    let cells = Rect::from_min_size(well.min, well.size() - Vec2::new(0.0, strip));
     ui.painter().rect(
         rect,
         style.radius,
@@ -509,7 +546,7 @@ pub fn show(
         paint(
             &ui.painter_at(rect),
             ui.ctx(),
-            well,
+            cells,
             &term,
             style,
             &mut st.guesses,
@@ -519,6 +556,9 @@ pub fn show(
             term.scroll_offset,
             focused,
         );
+    }
+    if let Some(notice) = notice {
+        out.restart = notice_strip(ui, notice, style, well, strip);
     }
     let term_state = emu.lock().unwrap().state();
 
@@ -541,7 +581,7 @@ pub fn show(
     let active_cell = pointer
         .interact_pos()
         .or(hover)
-        .and_then(|p| cell_at(well, style.cell, p));
+        .and_then(|p| cell_at(cells, style.cell, p));
 
     if started_inside {
         if let Some(cell) = active_cell {
@@ -656,6 +696,86 @@ pub fn show(
     }
 
     out
+}
+
+/// Paint the strip a finished session is announced in, and report whether its
+/// button was pressed.
+///
+/// The reason the grid stopped moving and the way to start it again belong
+/// together, so the strip lives inside the well rather than in a bar nobody
+/// looks at. The message is one line and truncates: the strip is only so tall,
+/// and the beginning of a long reason is more use than all of a short one
+/// pushed off the edge.
+fn notice_strip(ui: &mut Ui, notice: &Notice, style: &Style<'_>, well: Rect, strip: f32) -> bool {
+    let band = Rect::from_min_size(
+        Pos2::new(well.min.x, well.max.y - strip),
+        Vec2::new(well.width(), strip),
+    );
+    if band.width() <= 0.0 || band.height() <= 0.0 {
+        return false;
+    }
+    let painter = ui.painter_at(band);
+    painter.hline(band.x_range(), band.min.y, Stroke::new(1.0, style.border));
+
+    // The button is measured before the message is laid out, so the two cannot
+    // land on top of one another however long either of them turns out to be.
+    // The button paints its text at the same size the probe does, plus the
+    // horizontal padding of a themed button: 32 pt of room is that, generously.
+    let action = notice
+        .action
+        .as_ref()
+        .map(|label| (label, label_width(&painter, label) + 32.0));
+    let inset = 12.0;
+    let room = (band.width() - 2.0 * inset - action.as_ref().map_or(0.0, |(_, w)| *w)).max(0.0);
+    let message = Rect::from_min_size(
+        Pos2::new(band.min.x + inset, band.min.y),
+        Vec2::new(room, strip),
+    );
+    let _ = ui
+        .new_child(
+            UiBuilder::new()
+                .id_salt("notice message")
+                .max_rect(message)
+                .layout(Layout::left_to_right(Align::Center)),
+        )
+        .add(
+            egui::Label::new(
+                RichText::new(notice.text.as_str())
+                    .size(12.5)
+                    .color(notice.tone),
+            )
+            .truncate()
+            .selectable(false),
+        );
+
+    let Some((label, _)) = action else {
+        return false;
+    };
+    let box_ = Rect::from_min_max(
+        Pos2::new(band.min.x + inset, band.min.y),
+        Pos2::new(band.max.x - inset, band.max.y),
+    );
+    ui.new_child(
+        UiBuilder::new()
+            .id_salt("notice action")
+            .max_rect(box_)
+            .layout(Layout::right_to_left(Align::Center)),
+    )
+    .add(egui::Button::new(RichText::new(label.as_str()).size(12.5)).small())
+    .on_hover_cursor(CursorIcon::PointingHand)
+    .clicked()
+}
+
+/// How wide the label of the notice's button is, at the size the button draws it.
+fn label_width(painter: &Painter, label: &str) -> f32 {
+    painter
+        .layout_no_wrap(
+            label.to_string(),
+            FontId::proportional(12.5),
+            Color32::PLACEHOLDER,
+        )
+        .size()
+        .x
 }
 
 /// How many cells fit in `available`.
@@ -1019,7 +1139,7 @@ mod tests {
         };
         let mut st = State::default();
         let mut output = ctx.run_ui(raw, |ui| {
-            let _ = show(ui, &emu, &backend, &mut st, &style, false);
+            let _ = show(ui, &emu, &backend, &mut st, &style, false, None);
         });
         // There is no renderer here to apply the font texture to.
         output.textures_delta.clear();
@@ -1095,7 +1215,7 @@ mod tests {
                 border: Color32::TRANSPARENT,
             };
             let mut output = ctx.run_ui(raw, |ui| {
-                let _ = show(ui, &emu, &backend, &mut st, &style, menu_open);
+                let _ = show(ui, &emu, &backend, &mut st, &style, menu_open, None);
             });
             // There is no renderer here to apply the font texture to.
             output.textures_delta.clear();
@@ -1107,6 +1227,224 @@ mod tests {
                 assert_ne!(st.selection, before, "a click on the grid must start one");
                 assert!(st.dragging);
             }
+        }
+    }
+
+    /// What one laid-out frame of the widget reported.
+    struct Drawn {
+        /// The cost of one cell, as the widget was told to lay it out.
+        cell: Vec2,
+        /// The grid the screen ended up with, in cells.
+        grid: Vec2,
+        out: Output,
+        /// A press inside the cells starts a selection drag.
+        dragging: bool,
+        /// Every run of text the widget painted, with the height of its top.
+        text: Vec<(String, f32)>,
+        /// Every box the widget painted, filled or not.
+        boxes: Vec<Rect>,
+    }
+
+    /// Draw the widget on its own, once per entry of `passes`, and report the
+    /// last frame.
+    ///
+    /// A press only reaches a widget in the frame after the one that painted it:
+    /// egui hit-tests against the rectangles the previous pass left behind, so a
+    /// single frame can show a notice but never answer to its button.
+    ///
+    /// The widget is the only thing in the pass and the well has no padding, so
+    /// the grid starts at the top-left of the window and the strip reserved
+    /// beneath it sits at a height a test can name without measuring anything.
+    fn frames(notice: Option<&Notice>, passes: Vec<Vec<egui::Event>>) -> Drawn {
+        let emu = Arc::new(Mutex::new(Emulator::new(24, 80, 0)));
+        let backend = Arc::new(Mutex::new(None));
+        let palette = Palette::default();
+        let cell = Vec2::new(8.0, 16.0);
+        let style = Style {
+            font: FontId::monospace(14.0),
+            cell,
+            leading: 0.0,
+            palette: &palette,
+            cursor_on: false,
+            pad: 0.0,
+            radius: 0.0,
+            border: Color32::TRANSPARENT,
+        };
+        let mut st = State::default();
+        let ctx = egui::Context::default();
+        let mut drawn = Vec::new();
+        for events in passes {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 400.0))),
+                events,
+                ..Default::default()
+            };
+            let mut out = Output::default();
+            let mut output = ctx.run_ui(raw, |ui| {
+                out = show(ui, &emu, &backend, &mut st, &style, false, notice);
+            });
+            // There is no renderer here to apply the font texture to.
+            output.textures_delta.clear();
+            let (rows, cols) = emu.lock().unwrap().size();
+            let text: Vec<(String, f32)> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Text(painted) => {
+                        Some((painted.galley.text().to_string(), painted.pos.y))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let boxes: Vec<Rect> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| match &clipped.shape {
+                    egui::Shape::Rect(boxed) => Some(boxed.rect),
+                    _ => None,
+                })
+                .collect();
+            drawn.push(Drawn {
+                cell,
+                grid: Vec2::new(cols as f32, rows as f32),
+                out,
+                dragging: st.dragging,
+                text,
+                boxes,
+            });
+        }
+        drawn
+            .pop()
+            .expect("a widget that is never drawn has nothing to report")
+    }
+
+    /// One frame of [`frames`].
+    fn drawn(notice: Option<&Notice>, events: Vec<egui::Event>) -> Drawn {
+        frames(notice, vec![events])
+    }
+
+    /// The notice a session that went away is announced with.
+    fn hung_up() -> Notice {
+        Notice {
+            text: "the peer hung up".to_string(),
+            action: Some("Reconnect".to_string()),
+            tone: Color32::YELLOW,
+        }
+    }
+
+    /// A grid that has merely stopped moving looks exactly like a grid that is
+    /// still thinking, so the reason it stopped has to be on the screen: in the
+    /// well, and below every row the grid still paints.
+    #[test]
+    fn a_dead_session_says_so_inside_the_well() {
+        let alive = drawn(None, Vec::new());
+        let dead = drawn(Some(&hung_up()), Vec::new());
+        assert!(
+            dead.grid.y < alive.grid.y,
+            "the notice was laid over the grid instead of taking a strip off it: {} -> {}",
+            alive.grid.y,
+            dead.grid.y,
+        );
+        let strip = dead.grid.y * dead.cell.y;
+        let said = dead
+            .text
+            .iter()
+            .find(|(line, _)| line.contains("the peer hung up"))
+            .expect("nothing said why the session ended");
+        assert!(
+            said.1 >= strip && said.1 < strip + STRIP,
+            "the reason sits at {} rather than in the strip from {strip} to {}",
+            said.1,
+            strip + STRIP,
+        );
+        assert!(
+            alive
+                .text
+                .iter()
+                .all(|(line, _)| !line.contains("the peer hung up")),
+            "a session that is still running has nothing to report",
+        );
+    }
+
+    /// The notice is not there to be read and left: its button has to start the
+    /// whole thing over again.
+    #[test]
+    fn the_notice_button_starts_the_session_again() {
+        assert!(
+            !drawn(None, Vec::new()).out.restart,
+            "a session with nothing to say asked for nothing",
+        );
+        let dead = drawn(Some(&hung_up()), Vec::new());
+        let at = dead
+            .boxes
+            .iter()
+            .filter(|boxed| {
+                let strip = dead.grid.y * dead.cell.y;
+                boxed.center().y >= strip
+                    && boxed.max.y <= strip + STRIP
+                    && boxed.width() > 1.0
+                    && boxed.height() > 1.0
+            })
+            .max_by(|a, b| a.max.x.total_cmp(&b.max.x))
+            .expect("the notice painted no button")
+            .center();
+        let pressed = egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let released = egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        // The frame that paints the button is the frame that cannot be
+        // pressed: by the time the pointer answers, the button is there.
+        let down = frames(
+            Some(&hung_up()),
+            vec![vec![], vec![egui::Event::PointerMoved(at), pressed.clone()]],
+        );
+        assert!(!down.out.restart, "a press on its own starts nothing");
+        let click = frames(
+            Some(&hung_up()),
+            vec![
+                vec![],
+                vec![egui::Event::PointerMoved(at), pressed, released],
+            ],
+        );
+        assert!(
+            click.out.restart,
+            "the button at {at:?} did not ask for the session again",
+        );
+    }
+
+    /// The strip belongs to the notice rather than to the grid: reaching the button
+    /// must not copy whatever text the pointer passed over.
+    #[test]
+    fn a_click_on_the_strip_does_not_select_cells() {
+        let dead = drawn(Some(&hung_up()), Vec::new());
+        let in_the_grid = egui::pos2(4.0, 2.0 * dead.cell.y);
+        let on_the_strip = egui::pos2(4.0, dead.grid.y * dead.cell.y + STRIP - 8.0);
+        for (at, want) in [(in_the_grid, true), (on_the_strip, false)] {
+            let drawn = drawn(
+                Some(&hung_up()),
+                vec![
+                    egui::Event::PointerMoved(at),
+                    egui::Event::PointerButton {
+                        pos: at,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+            assert_eq!(
+                drawn.dragging, want,
+                "a press at {at:?} dragged: {}",
+                drawn.dragging
+            );
         }
     }
 }

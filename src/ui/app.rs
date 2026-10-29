@@ -21,6 +21,7 @@ use crate::ssh::{local::LocalPty, Backend};
 use crate::t;
 use crate::terminal::Emulator;
 use crate::ui::browser::Browser;
+use crate::ui::chrome;
 use crate::ui::dialogs::{self, ChallengeBuffer};
 use crate::ui::sidebar::{self, Sidebar};
 use crate::ui::terminal::{self as term_widget, Style as TermStyle};
@@ -148,6 +149,8 @@ pub struct App {
     show_settings: bool,
     show_transfers: bool,
     show_about: bool,
+    /// The native window frame, kept the same colour as the panels.
+    chrome: chrome::Chrome,
     term_menu: Option<(egui::Pos2, usize)>,
     /// Set on the frame the terminal menu opens, so the click that opened it
     /// cannot be mistaken for the click that dismisses it.
@@ -219,6 +222,7 @@ impl App {
             show_settings: false,
             show_transfers: false,
             show_about: false,
+            chrome: chrome::Chrome::default(),
             term_menu: None,
             term_menu_fresh: false,
             grid,
@@ -523,6 +527,32 @@ impl App {
     }
 }
 
+/// What a terminal says about a session that is no longer running.
+///
+/// The status bar goes grey and the grid stops moving, which looks a great deal
+/// like a session that is still thinking. One that has ended says so where the
+/// user is looking instead, and hands over the way back.
+fn closed_notice(ui: &Ui, status: &Status, local: bool) -> Option<term_widget::Notice> {
+    let (_, warn, bad, idle) = theme::tones(ui);
+    let (text, tone) = match status {
+        Status::Connecting | Status::Running => return None,
+        // A shell that exits is a courtesy; a peer that hangs up is not.
+        Status::Closed(None) if local => (t!("The shell has exited").to_string(), idle),
+        Status::Closed(None) => (t!("The connection was closed").to_string(), warn),
+        Status::Closed(Some(code)) => (
+            t!("The session ended - exit code {0}", code).to_string(),
+            if *code == 0 { idle } else { warn },
+        ),
+        Status::Failed(err) => (err.clone(), bad),
+    };
+    let again = if local { t!("Reopen") } else { t!("Reconnect") };
+    Some(term_widget::Notice {
+        text,
+        action: Some(again.to_string()),
+        tone,
+    })
+}
+
 fn non_empty(text: &str) -> Option<String> {
     let trimmed = text.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -583,7 +613,7 @@ const TERMINAL_FONTS: [(&str, &str); 9] = [
 /// symbol and East Asian fallbacks, then hand the lot to egui.
 fn setup_fonts(cc: &eframe::CreationContext<'_>, family: &str, size: f32) {
     let mut fonts = FontDefinitions::default();
-    install_terminal_font(&mut fonts, family);
+    install_terminal_font(&mut fonts, family, size);
     add_symbol_fallback(&mut fonts);
     if let Some(cjk) = add_cjk_fallback(&mut fonts) {
         tune_cjk_scale(&mut fonts, cjk, size);
@@ -591,14 +621,19 @@ fn setup_fonts(cc: &eframe::CreationContext<'_>, family: &str, size: f32) {
     cc.egui_ctx.set_fonts(fonts);
 }
 
-/// Put the first complete monospace face at the head of the terminal family.
+/// Put the chosen monospace face at the head of the terminal family.
 ///
 /// The family named in `config.toml` is tried first, then the candidates in
-/// coverage order; a face that has to borrow any grid glyph from a fallback
-/// gives way to the next one. When nothing installed covers the grid, egui's own
-/// embedded Hack heads the family: it needs no file, and its metrics are the
-/// same on every machine, which is what a grid wants.
-fn install_terminal_font(fonts: &mut FontDefinitions, family: &str) {
+/// coverage order. A face that owns the whole grid needs nothing else; one that
+/// only lacks the glyphs which never meet a neighbour - the eighth blocks, the
+/// shades and the braille patterns a chart is drawn from - keeps the row when it
+/// is the face that was asked for, and borrows those few from a complete partner
+/// scaled onto its column (see `install_grid_partner`). A face that has to borrow
+/// box drawing gives way to the next candidate: those meet their neighbours, so
+/// a borrowed dash puts a seam through every panel. When nothing installed
+/// covers the grid, egui's own embedded Hack heads the family: it needs no file,
+/// and its metrics are the same on every machine, which is what a grid wants.
+fn install_terminal_font(fonts: &mut FontDefinitions, family: &str, size: f32) {
     let wanted = family.trim().to_lowercase();
     let preferred = TERMINAL_FONTS
         .iter()
@@ -611,38 +646,50 @@ fn install_terminal_font(fonts: &mut FontDefinitions, family: &str) {
             .iter()
             .filter(move |face| Some(*face) != preferred),
     );
-    let needed = grid_glyphs().len();
+    let grid = grid_glyphs();
+    let joined = joined_glyphs();
+    let needed = grid.len();
     for face in ordered {
         let (name, path) = *face;
         let Ok(bytes) = std::fs::read(path) else {
             continue;
         };
         let data = FontData::from_owned(bytes);
-        let covered = grid_coverage(name, &data);
-        if covered < needed {
-            let missing = needed - covered;
-            // The family named in `config.toml` leads the queue, but it only gets
-            // the grid if it can actually paint one - honouring an incomplete face
-            // is what tears the layout apart - so say out loud why it was passed
-            // over rather than leaving it to a debug line nobody enables.
-            let level = if Some(face) == preferred {
-                log::Level::Info
-            } else {
-                log::Level::Debug
-            };
-            log::log!(
-                level,
-                "{name} is missing {missing} of the {needed} grid glyphs"
-            );
-            continue;
+        let covered = face_coverage(name, &data, &grid);
+        if covered == needed {
+            install_head(fonts, name, data);
+            log::info!("terminal font: {name}");
+            return;
         }
-        fonts.font_data.insert(name.to_string(), Arc::new(data));
-        let list = fonts.families.entry(FontFamily::Monospace).or_default();
-        if !list.iter().any(|face| face.as_str() == name) {
-            list.insert(0, name.to_string());
+        let borrowed = needed - covered;
+        // The family named in `config.toml` is the one that was asked for, so it
+        // keeps the row as long as it can paint every glyph that touches its
+        // neighbours; say out loud which few are borrowed rather than leaving it
+        // to a debug line nobody enables.
+        if Some(*face) == preferred.copied() && face_coverage(name, &data, &joined) == joined.len()
+        {
+            install_head(fonts, name, data);
+            match install_grid_partner(fonts, name, size) {
+                Some(partner) => {
+                    log::info!("terminal font: {name}, {borrowed} grid glyphs from {partner}")
+                }
+                None => {
+                    log::info!(
+                        "terminal font: {name}, {borrowed} grid glyphs left to egui's fallbacks"
+                    )
+                }
+            }
+            return;
         }
-        log::info!("terminal font: {name}");
-        return;
+        let level = if Some(face) == preferred {
+            log::Level::Info
+        } else {
+            log::Level::Debug
+        };
+        log::log!(
+            level,
+            "{name} is missing {borrowed} of the {needed} grid glyphs"
+        );
     }
     log::info!("terminal font: Hack (embedded)");
 }
@@ -657,11 +704,32 @@ fn grid_glyphs() -> Vec<char> {
         .collect()
 }
 
+/// The grid characters a face has to own outright: the box drawing that meets a
+/// neighbour across a cell boundary, and the DEC stand-ins, which are painted a
+/// cell at a time in the same run as the letters beside them. The rest of the
+/// grid - blocks, shades, braille, the odd triangle - sits alone in its cell, so
+/// a face may borrow those as long as the borrow costs exactly one column.
+fn joined_glyphs() -> Vec<char> {
+    (GRID_RANGES[0].0..=GRID_RANGES[0].1)
+        .filter_map(char::from_u32)
+        .chain(GRID_STRAYS)
+        .collect()
+}
+
+/// Register `name` as the face the terminal grid is painted from.
+fn install_head(fonts: &mut FontDefinitions, name: &str, data: FontData) {
+    fonts.font_data.insert(name.to_string(), Arc::new(data));
+    let list = fonts.families.entry(FontFamily::Monospace).or_default();
+    if !list.iter().any(|face| face.as_str() == name) {
+        list.insert(0, name.to_string());
+    }
+}
+
 /// The size the coverage probe measures a glyph at, in points.
 const PROBE_SIZE: f32 = 16.0;
 
-/// How many grid characters `data` paints on its own, with no fallback to lean
-/// on. A face that has to borrow a glyph charges nothing for it, so a nonzero
+/// How many of `glyphs` `data` paints on its own, with no fallback to lean on.
+/// A face that has to borrow a glyph charges nothing for it, so a nonzero
 /// advance is what "this face owns this cell" means.
 ///
 /// `FontsView::has_glyph` cannot say. It answers by comparing the face holding
@@ -673,7 +741,19 @@ const PROBE_SIZE: f32 = 16.0;
 /// A private atlas stands in for the one egui builds, because
 /// `Context::set_fonts` only takes effect at the start of the next pass and
 /// this has to be settled before the first frame is laid out.
-fn grid_coverage(name: &str, data: &FontData) -> usize {
+fn face_coverage(name: &str, data: &FontData, glyphs: &[char]) -> usize {
+    let font = FontId::monospace(PROBE_SIZE);
+    measure(&lone_face(name, data), |fonts| {
+        glyphs
+            .iter()
+            .filter(|ch| fonts.glyph_width(&font, **ch) > 0.0)
+            .count()
+    })
+}
+
+/// A font table holding nothing but `data`, so a probe has no fallback to lean
+/// on. See [`face_coverage`] for why the probe has to be a table of one.
+fn lone_face(name: &str, data: &FontData) -> FontDefinitions {
     let mut definitions = FontDefinitions::default();
     definitions.font_data.clear();
     definitions.families.clear();
@@ -683,14 +763,70 @@ fn grid_coverage(name: &str, data: &FontData) -> usize {
     definitions
         .families
         .insert(FontFamily::Monospace, vec![name.to_string()]);
-    let glyphs = grid_glyphs();
-    let font = FontId::monospace(PROBE_SIZE);
-    measure(&definitions, |fonts| {
-        glyphs
+    definitions
+}
+
+/// Queue a complete face behind `head` to paint the grid glyphs it cannot.
+///
+/// A borrowed glyph is laid out at the fallback's own advance, while one column
+/// is worth exactly the advance of the face that owns the row: Consolas charges
+/// 0.55 em for a glyph where Cascadia charges 0.59 em, so every borrow lands a
+/// twentieth of a column off the grid, and a bar built of eighth blocks turns
+/// into a staircase. `FontTweak::scale` moves the whole partner face onto the
+/// head's column, which is the only way a borrowed cell sits where the grid put
+/// it; the vertical cost of the same scale is a few pixels on a glyph that has
+/// no neighbour to line up with.
+///
+/// Returns the partner's name, or `None` when nothing complete is to be had -
+/// a machine with a single font installed, say.
+fn install_grid_partner(fonts: &mut FontDefinitions, head: &str, size: f32) -> Option<String> {
+    let (name, data) = grid_partner(fonts, head)?;
+    let column = advance(fonts, 'M', size);
+    let own = advance(&lone_face(&name, &data), 'M', size);
+    if column <= 0.0 || own <= 0.0 {
+        return None;
+    }
+    let mut data = data;
+    data.tweak = FontTweak {
+        scale: (column / own).clamp(0.6, 1.6),
+        ..Default::default()
+    };
+    // Under a name of its own: the same face heads the family outright wherever
+    // it covers the grid, and that copy has to keep its own scale.
+    let registered = format!("{name} grid");
+    fonts.font_data.insert(registered.clone(), Arc::new(data));
+    let list = fonts.families.entry(FontFamily::Monospace).or_default();
+    if !list.iter().any(|face| face == &registered) {
+        let after = list
             .iter()
-            .filter(|ch| fonts.glyph_width(&font, **ch) > 0.0)
-            .count()
-    })
+            .position(|face| face == head)
+            .map_or(0, |head| head + 1);
+        list.insert(after, registered);
+    }
+    Some(name)
+}
+
+/// The first face able to paint the whole terminal grid, other than `skip`.
+///
+/// An installed face reads better than a scaled one, so the candidates are
+/// walked in coverage order; egui's embedded Hack answers when a machine has
+/// nothing else, because it needs no file.
+fn grid_partner(fonts: &FontDefinitions, skip: &str) -> Option<(String, FontData)> {
+    let needed = grid_glyphs().len();
+    for (name, path) in TERMINAL_FONTS {
+        if name.eq_ignore_ascii_case(skip) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        let data = FontData::from_owned(bytes);
+        if face_coverage(name, &data, &grid_glyphs()) == needed {
+            return Some((name.to_string(), data));
+        }
+    }
+    let hack = fonts.font_data.get("Hack")?;
+    Some(("Hack".to_string(), hack.as_ref().clone()))
 }
 
 /// Run `probe` against a throwaway font atlas built from `definitions`.
@@ -884,10 +1020,35 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ctx = Some(ctx.clone());
         self.apply_theme(ctx);
+        // The title bar is painted by the operating system, which keeps its own
+        // idea of dark and light unless it is told: that is how a dark interface
+        // ends up wearing a white caption. The panels sit on `surface` and the
+        // title reads in `text`, so the frame is those two colours and no other.
+        let tokens = theme::tokens(self.store.config.theme, &self.palette);
+        self.chrome.follow(chrome::Want {
+            caption: tokens.surface,
+            text: tokens.text,
+            dark: tokens.dark,
+        });
         self.poll_prompts();
-        self.poll_connections();
+        if self.poll_connections() {
+            // A session that went away is worth announcing now rather than the
+            // next time the window is touched.
+            ctx.request_repaint();
+        }
         if self.queue.active() > 0 && !self.show_transfers {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        // A session that is supposed to be running is worth another look even
+        // while nobody types: a peer that dies outright can leave the shell
+        // waiting for a message that will never arrive, and nothing else would
+        // ask for the frame that notices it has gone.
+        if self
+            .tabs
+            .iter()
+            .any(|tab| tab.status.lock().unwrap().is_live())
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(1_000));
         }
     }
 
@@ -1066,21 +1227,31 @@ impl App {
         }
     }
 
-    fn poll_connections(&mut self) {
+    /// Notice a connection that died without saying so, and report whether a
+    /// session has just ended.
+    ///
+    /// A transport killed outright - a laptop closed, a server rebooted, a cable
+    /// pulled - can leave the shell channel waiting for a message that will never
+    /// come, so no event ever tells the interface the session is over. The
+    /// transport itself knows, and it is asked here.
+    fn poll_connections(&mut self) -> bool {
+        let mut ended = false;
         for tab in &mut self.tabs {
             let mut status = tab.status.lock().unwrap();
             if let Status::Running = *status {
-                let dropped = tab
+                let gone = tab
                     .conn
                     .lock()
                     .unwrap()
                     .as_ref()
                     .is_some_and(|conn| !conn.is_alive());
-                if dropped {
+                if gone {
                     *status = Status::Closed(None);
+                    ended = true;
                 }
             }
         }
+        ended
     }
 
     fn tick_blink(&mut self, ctx: &Context) {
@@ -1162,14 +1333,22 @@ impl App {
         }
     }
 
-    /// Close the tab on screen and open the same session again.
-    fn reconnect_active(&mut self) {
-        let Some(session) = self.tabs.get(self.active).map(|tab| tab.session.clone()) else {
+    /// Close a tab and open the same session again.
+    ///
+    /// `new_tab` puts the session at the end of the strip and looks at it, so
+    /// what the user asked for is what ends up on screen.
+    fn reconnect(&mut self, index: usize) {
+        let Some(session) = self.tabs.get(index).map(|tab| tab.session.clone()) else {
             return;
         };
-        let index = self.active;
         self.close_tab(index);
         self.launch(session);
+    }
+
+    /// Close the tab on screen and open the same session again.
+    fn reconnect_active(&mut self) {
+        let index = self.active;
+        self.reconnect(index);
     }
 
     fn cycle_tab(&mut self, delta: isize) {
@@ -1743,8 +1922,19 @@ impl App {
             border: theme::border(ui),
         };
         let menu_open = self.term_menu.is_some_and(|(_, tab)| tab == index);
+        let status = self.tabs[index].status.lock().unwrap().clone();
+        let local = self.tabs[index].session.protocol == Protocol::Local;
+        let notice = closed_notice(ui, &status, local);
         let tab = &mut self.tabs[index];
-        let out = term_widget::show(ui, &tab.emu, &tab.backend, &mut tab.view, &style, menu_open);
+        let out = term_widget::show(
+            ui,
+            &tab.emu,
+            &tab.backend,
+            &mut tab.view,
+            &style,
+            menu_open,
+            notice.as_ref(),
+        );
 
         if let Some((rows, cols)) = out.resized {
             if let Some(backend) = tab.backend.lock().unwrap().as_ref() {
@@ -1776,6 +1966,12 @@ impl App {
         if bell != tab.bell_seen {
             tab.bell_seen = bell;
             tab.flash = ui.input(|i| i.time);
+        }
+
+        // Last, because opening the session again closes the tab this frame is
+        // still drawing.
+        if out.restart {
+            self.reconnect(index);
         }
     }
 
@@ -2610,7 +2806,7 @@ mod tests {
         // whatever fonts the machine running the test happens to have.
         let embedded = FontDefinitions::default();
         let hack = &embedded.font_data["Hack"];
-        let covered = grid_coverage("Hack", hack);
+        let covered = face_coverage("Hack", hack, &grid_glyphs());
         assert!(covered > 0, "the probe sees no glyph in the embedded face");
         assert!(
             covered < grid_glyphs().len(),
@@ -2625,16 +2821,151 @@ mod tests {
     #[test]
     fn the_terminal_font_covers_the_grid_or_defers_to_the_embedded_one() {
         let mut fonts = FontDefinitions::default();
-        install_terminal_font(&mut fonts, "");
+        install_terminal_font(&mut fonts, "", 14.0);
         let head = fonts.families[&FontFamily::Monospace]
             .first()
             .cloned()
             .expect("the monospace family must not be empty");
-        let covered = grid_coverage(&head, &fonts.font_data[&head]) == grid_glyphs().len();
+        let grid = grid_glyphs();
+        let covered = face_coverage(&head, &fonts.font_data[&head], &grid) == grid.len();
         assert!(
             covered || head == "Hack",
             "{head} cannot paint the terminal grid"
         );
+    }
+
+    /// Whatever heads the family has to paint the glyphs that meet a neighbour
+    /// itself, and may only borrow the ones that stand alone in their cell. A
+    /// chosen face like Consolas is kept on those terms; an unasked-for one is
+    /// not, and egui's embedded face is the last resort, borrowed glyphs and all.
+    #[test]
+    fn the_terminal_font_owns_the_glyphs_that_join_a_row() {
+        for family in ["", "Consolas", "Cascadia Mono", "no-such-font"] {
+            let mut fonts = FontDefinitions::default();
+            install_terminal_font(&mut fonts, family, 14.0);
+            let head = fonts.families[&FontFamily::Monospace]
+                .first()
+                .cloned()
+                .expect("the monospace family must not be empty");
+            if head == "Hack" {
+                continue;
+            }
+            let joined = joined_glyphs();
+            let data = fonts.font_data[&head].as_ref().clone();
+            assert_eq!(
+                face_coverage(&head, &data, &joined),
+                joined.len(),
+                "{head} was chosen for {family:?} but cannot paint box drawing"
+            );
+        }
+    }
+
+    /// A borrowed glyph is laid out at the partner's own advance, so the partner
+    /// is scaled onto the head's column: without that, every eighth block in a
+    /// progress bar lands a fraction of a cell off the grid.
+    #[test]
+    fn borrowed_grid_glyphs_cost_one_column() {
+        let mut fonts = FontDefinitions::default();
+        // The embedded proportional face is a head that owns the Latin letters
+        // and precious little of the grid, so the borrow happens on every
+        // platform the test runs on, whatever fonts the machine has.
+        let head = "Ubuntu-Light";
+        let data = fonts.font_data[head].as_ref().clone();
+        install_head(&mut fonts, head, data.clone());
+        let size = 14.0;
+        install_grid_partner(&mut fonts, head, size).expect("egui embeds a grid partner");
+
+        let column = advance(&fonts, 'M', size);
+        assert!(column > 0.0, "the head face painted nothing");
+
+        let font = FontId::monospace(size);
+        let borrowed: Vec<char> = measure(&lone_face(head, &data), |fonts| {
+            grid_glyphs()
+                .into_iter()
+                .filter(|ch| fonts.glyph_width(&font, *ch) <= 0.0)
+                .collect()
+        });
+        assert!(!borrowed.is_empty(), "the head face owned the grid");
+
+        // What the shaper charges, not what `FontsView::glyph_width` reports:
+        // that helper prices a glyph at the face's own size and ignores
+        // `FontTweak::scale`, which is the very thing being checked here.
+        let off_grid: Vec<(char, f32)> = measure(&fonts, |fonts| {
+            borrowed
+                .iter()
+                .map(|ch| {
+                    let width = fonts
+                        .layout_no_wrap(ch.to_string(), font.clone(), Color32::WHITE)
+                        .size()
+                        .x;
+                    (*ch, width)
+                })
+                .filter(|(_, width)| *width <= 0.0 || (width - column).abs() > 0.1)
+                .collect()
+        });
+        assert!(
+            off_grid.is_empty(),
+            "borrowed glyphs came in off the {column:.2} pt column: {off_grid:?}"
+        );
+    }
+
+    /// What a terminal would say about a session, drawn from a real `Ui`
+    /// because the colours it writes the reason in come from the theme it is
+    /// painted in.
+    fn noticed(status: &Status, local: bool) -> Option<term_widget::Notice> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 300.0),
+            )),
+            ..Default::default()
+        };
+        let mut notice = None;
+        let mut output = ctx.run_ui(raw, |ui| {
+            notice = closed_notice(ui, status, local);
+        });
+        // There is no renderer here to apply the font texture to.
+        output.textures_delta.clear();
+        notice
+    }
+
+    /// The grey dot in a corner is not enough. A session that has stopped has to
+    /// be explained where the user is looking, in words that fit why it stopped,
+    /// with the button that starts it over.
+    #[test]
+    fn a_session_that_stopped_explains_itself() {
+        for status in [Status::Connecting, Status::Running] {
+            assert!(
+                noticed(&status, false).is_none(),
+                "{status:?} is not over yet",
+            );
+        }
+
+        let peer =
+            noticed(&Status::Closed(None), false).expect("a peer that hung up is worth mentioning");
+        let shell =
+            noticed(&Status::Closed(None), true).expect("a shell that exited is worth mentioning");
+        assert_ne!(peer.text, shell.text, "a shell is not a peer");
+        assert_ne!(peer.action, shell.action, "reconnecting is not reopening");
+
+        let ended =
+            noticed(&Status::Closed(Some(3)), false).expect("an exit code is worth mentioning");
+        assert!(
+            ended.text.contains('3'),
+            "{} says nothing about the exit code",
+            ended.text
+        );
+        let clean =
+            noticed(&Status::Closed(Some(0)), false).expect("a clean exit is worth mentioning");
+        let failed = noticed(&Status::Failed("no route to host".to_string()), false)
+            .expect("a session that never started is worth mentioning");
+        assert_eq!(
+            failed.text, "no route to host",
+            "the reason a session failed is the error itself",
+        );
+        assert_ne!(clean.tone, failed.tone, "a courtesy is not a failure");
+        assert_ne!(ended.tone, failed.tone, "an exit code is not a failure");
     }
 
     fn mods(ctrl: bool, shift: bool, alt: bool) -> egui::Modifiers {

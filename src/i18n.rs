@@ -222,6 +222,7 @@ fn zh(key: &'static str) -> &'static str {
         "Session properties" => "会话属性",
         "Edit session" => "编辑会话",
         "Reconnect" => "重新连接",
+        "Reopen" => "重新打开",
         "Reconnect\tCtrl+Shift+R" => "重新连接\tCtrl+Shift+R",
         "Close tab" => "关闭标签页",
         "Rename tab" => "重命名标签页",
@@ -359,6 +360,9 @@ fn zh(key: &'static str) -> &'static str {
         "connected" => "已连接",
         "closed" => "已断开",
         "exit code {0}" => "退出码 {0}",
+        "The connection was closed" => "连接已断开",
+        "The session ended - exit code {0}" => "会话已结束，退出码 {0}",
+        "The shell has exited" => "Shell 已退出",
         "reading server stats…" => "正在读取服务器状态…",
         "Logged-in accounts" => "已登录账户",
         "Uptime" => "运行时间",
@@ -530,6 +534,11 @@ mod tests {
             // entry would silently show English in a Chinese interface.
             "Passwords are stored in clear text in sessions.toml.",
             "Terminal, file browser and tunnels in one native app.",
+            // What a session that has ended says about itself.
+            "Reopen",
+            "The connection was closed",
+            "The session ended - exit code {0}",
+            "The shell has exited",
         ] {
             if neutral.contains(&key) {
                 continue;

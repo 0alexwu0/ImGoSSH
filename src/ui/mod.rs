@@ -1,6 +1,7 @@
 //! The egui front-end: session sidebar, terminal tabs, SFTP browser, dialogs.
 //!
 //! * [`app`] - the `eframe::App` shell that owns tabs, modals and the runtime.
+//! * [`chrome`] - the native window frame kept in step with the theme.
 //! * [`terminal`] - the VT100 widget.
 //! * [`sidebar`] - the session tree.
 //! * [`browser`] - the dual-pane SFTP / local file browser.
@@ -10,6 +11,7 @@
 
 pub mod app;
 pub mod browser;
+pub mod chrome;
 pub mod dialogs;
 pub mod properties;
 pub mod sidebar;

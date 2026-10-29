@@ -53,6 +53,11 @@ arboard = "3"
 rfd = "0.15"
 crossterm = "0.28"
 
+# The colour of the title bar is the operating system's to paint; see
+# `ui::chrome`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+
 [profile.release]
 opt-level = 2
 lto = "thin"

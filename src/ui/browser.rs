@@ -926,6 +926,10 @@ impl Browser {
         let (columns, show_time) = fit_columns(ui.available_width());
         let mut table = TableBuilder::new(ui)
             .striped(true)
+            // Cells inherit the layout of the pane that draws them, and that pane
+            // is a top-down one: every label stuck to the top of its row while the
+            // stripe - and the selection bar - filled the whole height of it.
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             // Shrink to the dock rather than asking for the full column width:
             // a side panel grows to whatever its content wants, and this table
             // used to inflate the dock a few pixels every single frame.
@@ -1078,6 +1082,7 @@ impl Browser {
         let (columns, show_time) = fit_columns(ui.available_width());
         let mut table = TableBuilder::new(ui)
             .striped(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .auto_shrink([false, true]);
         for column in columns {
             table = table.column(column);
@@ -1661,4 +1666,165 @@ fn read_dir(path: &Path) -> Vec<LocalEntry> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use egui::{CentralPanel, Context, Layout, RawInput, Shape};
+
+    /// The folders to list, spelled so no other label in the pane contains them.
+    const NAMES: [&str; 4] = ["zulu", "kilo", "lima", "mike"];
+
+    fn folder(name: &str) -> Entry {
+        Entry {
+            name: name.into(),
+            path: format!("/{name}"),
+            kind: Kind::Directory,
+            size: 4_096,
+            mtime: 1_700_000_000,
+            mode: 0o040_755,
+        }
+    }
+
+    /// A room the browser has all to itself, wide enough for both panes.
+    fn room() -> Rect {
+        Rect::from_min_size(Pos2::new(540.0, 40.0), Vec2::new(880.0, 700.0))
+    }
+
+    /// What a browser listing `NAMES` painted on its last frame, plus the two
+    /// colours a row can sit on: the selection bar and the alternating stripe.
+    fn painted(selected: Option<usize>) -> (Vec<Shape>, Color32, Color32) {
+        let ctx = Context::default();
+        // Read off the pane itself, so the test follows whatever style egui picked.
+        let mut colours = (Color32::PLACEHOLDER, Color32::PLACEHOLDER);
+        let queue = Queue::new();
+        let mut browser = Browser::new();
+        browser.entries = NAMES.iter().map(|name| folder(name)).collect();
+        browser.selected = selected;
+        // Both panes are fed by hand: no folder is read, no request leaves.
+        browser.booted = true;
+        browser.local_booted = true;
+
+        let mut raw = RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        let mut shapes = Vec::new();
+        for frame in 0..6 {
+            raw.time = Some(frame as f64 / 60.0);
+            let mut output = ctx.run_ui(raw.clone(), |root| {
+                CentralPanel::default().show(root, |ui| {
+                    colours = (
+                        ui.style().visuals.selection.bg_fill,
+                        ui.style().visuals.faint_bg_color,
+                    );
+                    fill_rect(ui, room(), Layout::top_down(egui::Align::Min), |ui| {
+                        browser.ui(ui, None, &queue);
+                    });
+                });
+            });
+            shapes = output
+                .shapes
+                .into_iter()
+                .map(|clipped| clipped.shape)
+                .collect();
+            // There is no renderer here, so drain the font atlas by hand.
+            output.textures_delta.clear();
+            raw.events.clear();
+        }
+        (shapes, colours.0, colours.1)
+    }
+
+    /// Bands of one colour, merged per row: the cells of a row share its height.
+    fn bands(shapes: &[Shape], fill: Color32) -> Vec<Rect> {
+        let mut rows: Vec<Rect> = Vec::new();
+        for shape in shapes {
+            let Shape::Rect(painted) = shape else {
+                continue;
+            };
+            let rect = painted.rect;
+            if painted.fill != fill || rect.width() < 40.0 {
+                continue;
+            }
+            // A row is 23 pt tall plus the spacing around it. Anything else in
+            // this colour is a button, a box or a separator, not a row.
+            if !(16.0..=40.0).contains(&rect.height()) {
+                continue;
+            }
+            match rows
+                .iter_mut()
+                .find(|row| row.min.y < rect.max.y && row.max.y > rect.min.y)
+            {
+                Some(row) => *row = row.union(rect),
+                None => rows.push(rect),
+            }
+        }
+        rows
+    }
+
+    /// Where the ink of one row landed.
+    fn ink(shapes: &[Shape], name: &str) -> Rect {
+        shapes
+            .iter()
+            .filter_map(|shape| {
+                let Shape::Text(text) = shape else {
+                    return None;
+                };
+                if !text.galley.job.text.contains(name) {
+                    return None;
+                }
+                Some(Rect::from_min_size(
+                    text.pos + text.galley.rect.min.to_vec2(),
+                    text.galley.rect.size(),
+                ))
+            })
+            .fold(Rect::NOTHING, |seen, rect| seen.union(rect))
+    }
+
+    #[test]
+    fn a_selected_row_sits_in_the_middle_of_its_bar() {
+        let (shapes, bar, _) = painted(Some(2));
+        let bars = bands(&shapes, bar);
+        assert_eq!(
+            bars.len(),
+            1,
+            "one row was selected, so exactly one bar should have been painted: {bars:?}"
+        );
+        let text = ink(&shapes, NAMES[2]);
+        assert!(!text.is_negative(), "{} was never drawn", NAMES[2]);
+        let drift = bars[0].center().y - text.center().y;
+        assert!(
+            drift.abs() <= 1.0,
+            "the label of the selected row slipped {drift:+.1} px out of the bar behind it: \
+             bar {:?}, text {:?}",
+            bars[0],
+            text
+        );
+    }
+
+    #[test]
+    fn every_row_sits_in_the_middle_of_the_band_it_is_on() {
+        let (shapes, _, stripe) = painted(None);
+        let striped = bands(&shapes, stripe);
+        let mut measured = 0;
+        for name in NAMES {
+            let text = ink(&shapes, name);
+            assert!(!text.is_negative(), "{name} was never drawn");
+            let Some(band) = striped.iter().find(|band| band.contains(text.center())) else {
+                continue;
+            };
+            let drift = band.center().y - text.center().y;
+            assert!(
+                drift.abs() <= 1.0,
+                "{name} slipped {drift:+.1} px out of the stripe behind it: stripe {band:?}, text {text:?}"
+            );
+            measured += 1;
+        }
+        assert!(
+            measured >= 2,
+            "too few striped rows to measure against: {striped:?}"
+        );
+    }
 }

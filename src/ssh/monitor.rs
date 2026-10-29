@@ -275,6 +275,10 @@ impl Monitor {
                 tokio::time::sleep(interval).await;
             }
             *info.lock().unwrap() = None;
+            // The loop ends when the transport does, and that is exactly the
+            // moment the interface has something to say about. A connection
+            // that has stopped answering is not going to ask for the frame.
+            repaint();
         });
     }
 
