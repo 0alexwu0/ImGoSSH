@@ -79,14 +79,14 @@ SSH 家族协议由本项目自己实现：**不 fork、不调用、也不需要
 
 ### 下载二进制
 
-到 [Releases](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.1.2) 取对应平台的包，每个都含 `imgossh` 图形主程序、`igssh` / `igscp` / `igsftp` 三个命令行工具，以及 `LICENSE` 与 `README.md`；发布说明里列出了每个包的 SHA-256，下载后可自行校验。
+到 [Releases](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.1.3) 取对应平台的包，每个都含 `imgossh` 图形主程序、`igssh` / `igscp` / `igsftp` 三个命令行工具，以及 `LICENSE` 与 `README.md`；发布说明里列出了每个包的 SHA-256，下载后可自行校验。
 
 | 平台 | 包 | 形式 |
 | --- | --- | --- |
-| Windows x86-64 | `ImGoSSH-0.1.2-windows-x64.zip` | 免安装，解压即用 |
-| Linux x86-64 | `ImGoSSH-0.1.2-linux-x86_64.tar.gz` | `tar xzf` 后直接运行 |
-| macOS（Apple Silicon） | `ImGoSSH-0.1.2-macos-aarch64.zip` | 未签名，见下方说明 |
-| macOS（Intel） | `ImGoSSH-0.1.2-macos-x86_64.zip` | 未签名，见下方说明 |
+| Windows x86-64 | `ImGoSSH-0.1.3-windows-x64.zip` | 免安装，解压即用 |
+| Linux x86-64 | `ImGoSSH-0.1.3-linux-x86_64.tar.gz` | `tar xzf` 后直接运行 |
+| macOS（Apple Silicon） | `ImGoSSH-0.1.3-macos-aarch64.zip` | 未签名，见下方说明 |
+| macOS（Intel） | `ImGoSSH-0.1.3-macos-x86_64.zip` | 未签名，见下方说明 |
 
 Linux 包不依赖 GTK：二进制只硬链接 `glibc`，X11 / Wayland 后端与文件对话框（`xdg-desktop-portal`）都在运行时按需加载，主流桌面发行版开箱即用。macOS 包没有开发者证书签名与公证，首次运行会被 Gatekeeper 拦下，在「系统设置 → 隐私与安全性」点「仍要打开」，或者对解压出来的目录执行 `xattr -dr com.apple.quarantine <目录>`。
 
