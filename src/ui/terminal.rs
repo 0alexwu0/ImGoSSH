@@ -84,10 +84,8 @@ pub struct State {
 /// Colours and metrics for one frame.
 pub struct Style<'a> {
     pub font: FontId,
-    pub cell: Vec2,
-    /// Air `line_spacing` adds to a row, shared between its top and its bottom.
-    /// Zero leaves a row exactly as tight as the glyphs that fill it.
-    pub leading: f32,
+    /// What a cell costs, and where the glyphs of a row sit inside it.
+    pub grid: Grid,
     pub palette: &'a Palette,
     /// Cursor phase, driven by the blink timer.
     pub cursor_on: bool,
@@ -97,6 +95,95 @@ pub struct Style<'a> {
     pub radius: f32,
     /// Hairline around the well.
     pub border: Color32,
+}
+
+/// The grid a terminal paints into: what one cell costs, and where the glyphs of
+/// a row sit inside the band it owns.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Grid {
+    /// The box one character cell takes, in points.
+    pub cell: Vec2,
+    /// Points from the top of a row band to the top of the box its glyphs are
+    /// laid out in.
+    pub inset: f32,
+    /// Points from the top of a row band to the baseline those glyphs are drawn
+    /// on, which is where an underline is struck.
+    pub baseline: f32,
+    /// Points from that baseline to the bottom of the ink that hangs below it.
+    pub descent: f32,
+}
+
+/// The ascenders, descenders and rules that say how tall a row of ink is.
+const INK_PROBE: &str = "Hxlp|_";
+
+impl Grid {
+    /// The grid for one terminal face at one size.
+    ///
+    /// The width is the advance and nothing else: every column is placed from
+    /// this number, so it has to be the width the shaper itself charges for a
+    /// glyph. The height is the text box as `line_spacing` wants it. Latin asks
+    /// for little; a page of Chinese fills its box from edge to edge, and the
+    /// same row height reads as lines pressed against each other.
+    ///
+    /// What a row centres on the band is the ink of a face, not the box its
+    /// glyphs are laid out in. egui keeps a face's whole line gap under the
+    /// descent, so a row that centres its box parks the letters wherever that
+    /// gap happens to leave them. A face that keeps the gap below, as Consolas
+    /// does, then writes its text a couple of points above the block cursor -
+    /// which fills the cell, the way a terminal cursor does - and the two read
+    /// as two different lines.
+    pub fn measure(ctx: &Context, font: &FontId, line_spacing: f32) -> Self {
+        let (advance, glyph_box, ascent, ink) = ctx.fonts_mut(|fonts| {
+            let advance = fonts.glyph_width(font, 'M');
+            let laid = fonts.layout_no_wrap("M".to_string(), font.clone(), Color32::WHITE);
+            let ascent = laid
+                .rows
+                .first()
+                .and_then(|row| row.glyphs.first())
+                .map(|glyph| glyph.pos.y)
+                .unwrap_or(0.0);
+            let ink = fonts
+                .layout_no_wrap(INK_PROBE.to_string(), font.clone(), Color32::WHITE)
+                .mesh_bounds;
+            (advance, laid.size(), ascent, ink)
+        });
+        let box_height = glyph_box.y;
+        let width = if advance > 0.0 { advance } else { glyph_box.x };
+        if width <= 0.0 || box_height <= 0.0 {
+            return Self {
+                cell: Vec2::new(8.0, 16.0),
+                inset: 1.0,
+                baseline: 12.0,
+                descent: 3.0,
+            };
+        }
+        let ascent = if ascent > 0.0 {
+            ascent
+        } else {
+            box_height * 0.75
+        };
+        let height = box_height * line_spacing.clamp(0.6, 3.0);
+        let inked = ink.max.y > ink.min.y;
+        // The middle of the ink sits `(min.y + max.y) / 2` below the top of the
+        // box it is painted in, so a box this far below the top of the band puts
+        // that middle in the middle of the band. A face whose probe inked
+        // nothing has no ink to aim at and falls back on its box.
+        let inset = if inked {
+            (height - ink.min.y - ink.max.y) * 0.5
+        } else {
+            (height - box_height) * 0.5
+        };
+        Self {
+            cell: Vec2::new(width, height),
+            inset,
+            baseline: inset + ascent,
+            descent: if inked {
+                (ink.max.y - ascent).max(1.0)
+            } else {
+                (height - inset - ascent).max(1.0)
+            },
+        }
+    }
 }
 
 /// What the widget asks of its owner after a frame.
@@ -299,11 +386,12 @@ fn paint(
     let default_bg = rgb(style.palette.background);
     let default_fg = rgb(style.palette.foreground);
     let selection_bg = rgb(style.palette.selection);
-    let cell = style.cell;
-    // A row may be taller than the text in it. The glyphs keep their own
-    // height and take the middle of the band, so leading lands half above and
-    // half below rather than all of it under the baseline.
-    let inset = style.leading * 0.5;
+    let cell = style.grid.cell;
+    // A row is usually taller than the text in it. The glyphs keep their own
+    // height and take the middle of the band - the middle of their ink, not of
+    // the box egui laid them out in - so the block cursor, which fills the
+    // cell, has the text it stands for in the middle of it.
+    let inset = style.grid.inset;
     let screen = term.screen();
     let mut cells: Vec<(char, u16)> = Vec::new();
 
@@ -357,9 +445,11 @@ fn paint(
                 painter.rect_filled(box_rect, 0.0, run.bg);
             }
             if run.underline {
+                // Struck just under the letters rather than at the foot of the
+                // cell, so it stays with the text as the row grows taller.
                 painter.hline(
                     x..=x + width,
-                    y + cell.y - inset - 1.5,
+                    y + style.grid.baseline + style.grid.descent * 0.5,
                     Stroke::new(1.0, run.fg),
                 );
             }
@@ -489,7 +579,7 @@ pub fn show(
     let notice = notice.filter(|_| room.y > 5.0 * STRIP);
     let strip = if notice.is_some() { STRIP } else { 0.0 };
     let available = room - Vec2::new(2.0 * style.pad, 2.0 * style.pad + strip);
-    let (want_cols, want_rows) = fit(available, style.cell);
+    let (want_cols, want_rows) = fit(available, style.grid.cell);
     let (rows, cols) = {
         let mut term = emu.lock().unwrap();
         if (want_cols, want_rows) != term.size() {
@@ -498,10 +588,13 @@ pub fn show(
         term.size()
     };
 
-    let grid = Vec2::new(cols as f32 * style.cell.x, rows as f32 * style.cell.y);
+    let span = Vec2::new(
+        cols as f32 * style.grid.cell.x,
+        rows as f32 * style.grid.cell.y,
+    );
     let size = Vec2::new(
-        grid.x.min(available.x).max(style.cell.x),
-        grid.y.min(available.y).max(style.cell.y),
+        span.x.min(available.x).max(style.grid.cell.x),
+        span.y.min(available.y).max(style.grid.cell.y),
     ) + Vec2::new(2.0 * style.pad, 2.0 * style.pad + strip);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let focused = response.has_focus();
@@ -581,7 +674,7 @@ pub fn show(
     let active_cell = pointer
         .interact_pos()
         .or(hover)
-        .and_then(|p| cell_at(cells, style.cell, p));
+        .and_then(|p| cell_at(cells, style.grid.cell, p));
 
     if started_inside {
         if let Some(cell) = active_cell {
@@ -675,7 +768,7 @@ pub fn show(
     if hovered {
         let scroll = ui.input(|i| i.smooth_scroll_delta).y;
         if scroll.abs() > 1.0 {
-            let lines = (scroll / style.cell.y).trunc() as isize;
+            let lines = (scroll / style.grid.cell.y).trunc() as isize;
             if lines != 0 {
                 emu.lock().unwrap().scroll(lines);
                 ui.ctx().request_repaint();
@@ -1042,6 +1135,26 @@ pub const RELEASE: u16 = MOUSE_RELEASE;
 mod tests {
     use super::*;
 
+    /// `Grid::measure` for `font`, taken in a context of its own: egui has no
+    /// fonts until a context has begun a pass, and a test measures before it
+    /// draws anything. Both contexts are the default ones at one point per
+    /// point, so what one measures is what the other draws.
+    fn measured_grid(font: &FontId, line_spacing: f32) -> Grid {
+        let ctx = egui::Context::default();
+        // The font atlas only exists once a pass has begun.
+        ctx.begin_pass(egui::RawInput::default());
+        Grid::measure(&ctx, font, line_spacing)
+    }
+
+    /// The grid of `font` pinned to `cell`, so a test can name a column in
+    /// points without caring how tall a row the face behind it asks for.
+    fn pinned_grid(font: &FontId, cell: Vec2) -> Grid {
+        Grid {
+            cell,
+            ..measured_grid(font, 1.0)
+        }
+    }
+
     // Every cell has to land on its own column. A character the terminal face
     // cannot paint arrives from a fallback face with a different advance, and left
     // to itself that glyph drags the rest of the row sideways with it.
@@ -1081,6 +1194,76 @@ mod tests {
         );
     }
 
+    // A block cursor fills its cell, as a terminal cursor does, so the text it
+    // belongs to has to hold the middle of that cell. A face keeps most of its
+    // blank in the box below the baseline - egui keeps all of its line gap there
+    // - so a row centred on the box it is laid out in writes its letters above
+    // the block, and the pair reads as two lines rather than one.
+    #[test]
+    fn the_cursor_block_holds_the_text_it_sits_on() {
+        let emu = Arc::new(Mutex::new(Emulator::new(4, 20, 0)));
+        let backend = Arc::new(Mutex::new(None));
+        let palette = Palette::default();
+        // Ascenders, descenders and the underscore: the tallest and the lowest
+        // ink a row of text can carry, so the row is measured over all of it.
+        emu.lock().unwrap().feed(b"Hxlp|_");
+        let font = FontId::monospace(16.0);
+        let grid = measured_grid(&font, 1.0);
+        let ctx = egui::Context::default();
+        let style = Style {
+            font,
+            grid,
+            palette: &palette,
+            cursor_on: true,
+            pad: 0.0,
+            radius: 0.0,
+            border: Color32::TRANSPARENT,
+        };
+        let mut st = State::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show(ui, &emu, &backend, &mut st, &style, false, None);
+            },
+        );
+        // There is no renderer here to apply the font texture to.
+        output.textures_delta.clear();
+
+        let (row, col) = emu.lock().unwrap().cursor();
+        let block = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Rect(boxed) => Some(boxed.rect),
+                _ => None,
+            })
+            .find(|boxed| {
+                (boxed.center().x - (col as f32 + 0.5) * grid.cell.x).abs() < 0.5
+                    && (boxed.width() - (grid.cell.x - 2.0)).abs() < 0.5
+            })
+            .expect("the grid painted no cursor");
+        let ink = output
+            .shapes
+            .iter()
+            .find_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(painted) if painted.galley.text().contains("Hxlp") => {
+                    Some(painted.pos.y + painted.galley.mesh_bounds.center().y)
+                }
+                _ => None,
+            })
+            .expect("the grid painted no text");
+        assert_eq!((row, col), (0, 6), "the test draws one word and a cursor");
+        assert!(
+            (block.center().y - ink).abs() <= 0.75,
+            "the block on row {row} is centred on {} while its text is centred on {}",
+            block.center().y,
+            ink,
+        );
+    }
+
     /// Text the face can paint on its own stays one run: snapping a grid that
     /// already lines up would only buy layout work.
     #[test]
@@ -1114,6 +1297,7 @@ mod tests {
         let backend = Arc::new(Mutex::new(None));
         let palette = Palette::default();
         let cell = Vec2::new(8.0, 16.0);
+        let font = FontId::monospace(14.0);
         // Box drawing, the shades and the eighth blocks a bar is drawn from,
         // braille, and one ideograph: egui's own faces hold none of these.
         let art = ("\u{250c}\u{2500}\u{2500} Speed \u{2500}\u{2510}\u{2591}\u{2592}\u{2593}\u{2588}\u{2581}\u{2800}\u{7528} tail\u{0d}\u{0a}").repeat(3);
@@ -1128,9 +1312,8 @@ mod tests {
             ..Default::default()
         };
         let style = Style {
-            font: FontId::monospace(14.0),
-            cell,
-            leading: 0.0,
+            font: font.clone(),
+            grid: pinned_grid(&font, cell),
             palette: &palette,
             cursor_on: false,
             pad: 0.0,
@@ -1176,6 +1359,8 @@ mod tests {
         let emu = Arc::new(Mutex::new(Emulator::new(4, 20, 0)));
         let backend = Arc::new(Mutex::new(None));
         let palette = Palette::default();
+        let font = FontId::monospace(12.0);
+        let grid = pinned_grid(&font, Vec2::new(8.0, 16.0));
         let before = Some(Selection {
             start: (0, 0),
             end: (0, 3),
@@ -1205,9 +1390,8 @@ mod tests {
                 },
             ];
             let style = Style {
-                font: FontId::monospace(12.0),
-                cell: Vec2::new(8.0, 16.0),
-                leading: 0.0,
+                font: font.clone(),
+                grid,
                 palette: &palette,
                 cursor_on: true,
                 pad: 0.0,
@@ -1260,10 +1444,10 @@ mod tests {
         let backend = Arc::new(Mutex::new(None));
         let palette = Palette::default();
         let cell = Vec2::new(8.0, 16.0);
+        let font = FontId::monospace(14.0);
         let style = Style {
-            font: FontId::monospace(14.0),
-            cell,
-            leading: 0.0,
+            font: font.clone(),
+            grid: pinned_grid(&font, cell),
             palette: &palette,
             cursor_on: false,
             pad: 0.0,

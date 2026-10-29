@@ -24,7 +24,7 @@ use crate::ui::browser::Browser;
 use crate::ui::chrome;
 use crate::ui::dialogs::{self, ChallengeBuffer};
 use crate::ui::sidebar::{self, Sidebar};
-use crate::ui::terminal::{self as term_widget, Style as TermStyle};
+use crate::ui::terminal::{self as term_widget, Grid, Style as TermStyle};
 use crate::ui::theme;
 use crate::util::{human_rate, human_size, human_uptime};
 
@@ -160,22 +160,14 @@ pub struct App {
     /// The `line_spacing` `grid` was measured against, so a change to it is
     /// noticed without measuring the grid on every frame.
     spacing: f32,
+    /// The scale factor `grid` was measured at: a window that moves to another
+    /// monitor has its rows measured again, not only its font.
+    scale: f32,
     font: FontId,
     cursor_on: bool,
     blink_at: f64,
 
     dirty: bool,
-}
-
-/// The grid a terminal tab paints into: what one cell costs, and the air a row
-/// gets around the glyphs inside it.
-#[derive(Clone, Copy, Default)]
-struct Grid {
-    /// The box one character cell takes, in points.
-    cell: Vec2,
-    /// Air `line_spacing` adds to a row, shared between its top and its bottom.
-    /// Zero leaves a row exactly as tight as the glyphs that fill it.
-    leading: f32,
 }
 
 impl App {
@@ -195,6 +187,7 @@ impl App {
         // cell metrics are measured on the first frame instead of here.
         let grid = Grid::default();
         let spacing = 0.0;
+        let scale = 0.0;
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
@@ -227,6 +220,7 @@ impl App {
             term_menu_fresh: false,
             grid,
             spacing,
+            scale,
             font,
             cursor_on: true,
             blink_at: 0.0,
@@ -940,32 +934,6 @@ fn install_fallback(
     Some(name)
 }
 
-/// The grid metrics for one terminal face at one size.
-///
-/// The width is the advance and nothing else: every column is placed from this
-/// number, so it has to be the width the shaper itself charges for a glyph.
-/// The height is the text box as `line_spacing` wants it. Latin asks for
-/// little; a page of Chinese fills its box from edge to edge, and the same row
-/// height reads as lines pressed against each other.
-fn measure_cell(ctx: &Context, font: &FontId, line_spacing: f32) -> Grid {
-    let advance = ctx.fonts_mut(|fonts| fonts.glyph_width(font, 'M'));
-    let galley =
-        ctx.fonts_mut(|fonts| fonts.layout_no_wrap("M".to_string(), font.clone(), Color32::WHITE));
-    let size = galley.size();
-    let width = if advance > 0.0 { advance } else { size.x };
-    if width <= 0.0 || size.y <= 0.0 {
-        return Grid {
-            cell: Vec2::new(8.0, 16.0),
-            leading: 0.0,
-        };
-    }
-    let height = size.y * line_spacing.clamp(0.6, 3.0);
-    Grid {
-        cell: Vec2::new(width, height),
-        leading: height - size.y,
-    }
-}
-
 impl App {
     /// Repaint the whole shell with the tokens of the chosen theme.
     fn apply_theme(&self, ctx: &Context) {
@@ -997,11 +965,14 @@ impl App {
         // The font atlas only exists once a frame is being laid out, which is
         // why the grid is measured here rather than in `with_startup`: the
         // first pass takes it, and so does any pass where the face, its size,
-        // or the requested line spacing has moved.
+        // the requested line spacing or the scale the rows are drawn at has moved.
         let spacing = self.store.config.line_spacing;
-        if font_changed || spacing != self.spacing || self.grid.cell.y <= 0.0 {
-            self.grid = measure_cell(ctx, &font, spacing);
+        let scale = ctx.pixels_per_point();
+        if font_changed || spacing != self.spacing || scale != self.scale || self.grid.cell.y <= 0.0
+        {
+            self.grid = Grid::measure(ctx, &font, spacing);
             self.spacing = spacing;
+            self.scale = scale;
             self.font = font;
             ctx.request_repaint();
         }
@@ -1913,8 +1884,7 @@ impl App {
             .effective_palette(palette);
         let style = TermStyle {
             font: font.clone(),
-            cell: grid.cell,
-            leading: grid.leading,
+            grid,
             palette: &palette,
             cursor_on,
             pad: 10.0,
