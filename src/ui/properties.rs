@@ -373,7 +373,7 @@ impl Properties {
                 self.permissions(ui, &info);
                 if let Some(note) = &self.note {
                     let text = note.clone();
-                    ui.label(RichText::new(text).size(11.5).color(theme::accent_text(ui)));
+                    ui.label(RichText::new(text).size(11.5).color(theme::accent(ui)));
                 }
                 if let Some(error) = &self.error {
                     let text = error.clone();

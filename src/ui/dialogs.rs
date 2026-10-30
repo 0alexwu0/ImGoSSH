@@ -1,6 +1,6 @@
 //! Modal dialogs: session properties, credentials, host keys, tunnels, settings.
 
-use egui::{CornerRadius, FontId, RichText, Sense, Ui, Vec2};
+use egui::{Color32, CornerRadius, FontId, RichText, Sense, Ui, Vec2};
 
 use crate::config::{Config, Protocol, Session, Tunnel, TunnelKind};
 use crate::i18n::{tr, Lang};
@@ -8,7 +8,8 @@ use crate::ssh::client::{Challenge, HostKeyInfo, Reply, Trust};
 use crate::ssh::transfer::{Phase, Queue};
 use crate::t;
 use crate::ui::theme;
-use crate::util::{human_rate, human_size};
+use crate::update;
+use crate::util::{human_duration, human_rate, human_size, human_time};
 
 /// Result of the session properties dialog.
 #[derive(Debug, PartialEq)]
@@ -747,6 +748,25 @@ pub fn settings_dialog(ui: &mut Ui, config: &mut Config, open: &mut bool) -> boo
                             .color(warn),
                         );
                     }
+
+                    theme::section(ui, t!("Updates"));
+                    changed |= ui
+                        .checkbox(
+                            &mut config.check_updates,
+                            t!("Check GitHub for a newer version"),
+                        )
+                        .changed();
+                    ui.label(
+                        RichText::new(t!("Checked when ImGoSSH starts and again every six hours."))
+                            .size(11.0)
+                            .color(muted),
+                    );
+                    let checked = if config.last_update_check > 0 {
+                        t!("Last checked: {0}", human_time(config.last_update_check))
+                    } else {
+                        t!("Never checked").to_string()
+                    };
+                    ui.label(RichText::new(checked).size(11.0).color(muted));
                 });
         });
     changed
@@ -916,6 +936,337 @@ pub fn about_dialog(ui: &mut Ui) -> bool {
             );
         });
     !open
+}
+
+/// What the update window was asked to do next.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    #[default]
+    Nothing,
+    /// Fetch the package and move it into place.
+    Update,
+    /// Stop the download and throw away whatever came in.
+    Cancel,
+    /// Stop offering one version, named by its own text.
+    Skip(String),
+    /// Start the program that has just been installed.
+    Relaunch,
+    /// Ask GitHub again.
+    Recheck,
+}
+
+/// One caption with the version under it: a column of the update header.
+fn version_column(ui: &mut Ui, caption: &str, value: &str, colour: Color32, muted: Color32) {
+    ui.vertical(|ui| {
+        ui.label(RichText::new(caption).size(11.0).color(muted));
+        ui.label(RichText::new(value).size(17.0).color(colour));
+    });
+}
+
+/// The window that says what is new, and installs it when told to.
+///
+/// `blocked` is the reason an update must not start right now - a transfer
+/// still running, say - and it holds the one button that matters out of reach.
+pub fn update_dialog(
+    ui: &mut Ui,
+    status: &update::Status,
+    blocked: Option<&str>,
+    open: &mut bool,
+) -> UpdateOutcome {
+    let mut outcome = UpdateOutcome::Nothing;
+    let mut dismiss = false;
+    let (live, working, warn, muted) = theme::tones(ui);
+    let accent = theme::accent(ui);
+    let text = ui.visuals().text_color();
+    let stage = status.stage;
+    let here = update::current_version().text();
+    let newest = status.available().map(|version| version.text());
+    let asset = status
+        .release
+        .as_ref()
+        .and_then(|release| release.asset())
+        .cloned();
+    // The release page is where a download that will not install has to finish.
+    let release_url = status
+        .release
+        .as_ref()
+        .map(|release| release.url.clone())
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| crate::config::RELEASES_URL.to_string());
+
+    egui::Window::new(t!("Software update"))
+        .open(open)
+        .collapsible(false)
+        .resizable(true)
+        .default_size(Vec2::new(490.0, 470.0))
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .show(ui.ctx(), |ui| {
+            ui.set_min_width(430.0);
+
+            // The two versions side by side: what is running, and what GitHub
+            // says is newest. Colour says which way the news is good.
+            ui.horizontal(|ui| {
+                version_column(ui, t!("Current version"), &here, text, muted);
+                match &newest {
+                    Some(version) => {
+                        // The arrow says which way the news is good, and it
+                        // stays true once the update is merely waiting for a
+                        // restart.
+                        if matches!(stage, update::Stage::Available | update::Stage::Ready) {
+                            ui.label(RichText::new("\u{2192}").size(14.0).color(muted));
+                        }
+                        let colour = match stage {
+                            update::Stage::Available | update::Stage::Ready => accent,
+                            update::Stage::Latest => live,
+                            _ => text,
+                        };
+                        version_column(ui, t!("Newest version"), version, colour, muted);
+                    }
+                    None => {
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(t!("Newest version")).size(11.0).color(muted));
+                            ui.label(
+                                RichText::new(if stage == update::Stage::Checking {
+                                    t!("Checking GitHub...")
+                                } else {
+                                    t!("not checked yet")
+                                })
+                                .size(13.0)
+                                .italics()
+                                .color(muted),
+                            );
+                        });
+                    }
+                }
+            });
+            if stage == update::Stage::Latest {
+                ui.label(
+                    RichText::new(t!("This build is already the newest one."))
+                        .size(11.5)
+                        .color(live),
+                );
+            }
+            if stage == update::Stage::Available && asset.is_none() {
+                ui.label(
+                    RichText::new(t!("No package for this platform was published."))
+                        .size(11.5)
+                        .color(warn),
+                );
+            }
+
+            if let Some(release) = &status.release {
+                let mut meta = Vec::new();
+                if !release.published.is_empty() {
+                    meta.push(t!("Published {0}", release.published).to_string());
+                }
+                if let Some(asset) = &asset {
+                    if asset.size > 0 {
+                        meta.push(human_size(asset.size));
+                    }
+                }
+                if !meta.is_empty() {
+                    ui.label(
+                        RichText::new(meta.join("  \u{b7}  "))
+                            .size(11.0)
+                            .color(muted),
+                    );
+                }
+            }
+            // Where the files go: an update that has to be finished by hand
+            // starts from knowing which folder that is.
+            ui.label(
+                RichText::new(t!("Install location: {0}", update::install_dir().display()))
+                    .size(10.5)
+                    .color(muted),
+            );
+            ui.add_space(8.0);
+
+            match stage {
+                update::Stage::Checking => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            RichText::new(t!("Checking GitHub..."))
+                                .size(11.5)
+                                .color(muted),
+                        );
+                    });
+                }
+                update::Stage::Downloading => {
+                    let mut line = format!(
+                        "{} \u{b7} {} \u{b7} {}",
+                        human_size(status.downloaded),
+                        human_size(status.total),
+                        human_rate(status.rate)
+                    );
+                    if let Some(eta) = status.eta() {
+                        line.push_str(&format!(" \u{b7} {}", t!("{0} left", human_duration(eta))));
+                    }
+                    theme::meter(ui, status.percent(), 320.0, line, working);
+                }
+                update::Stage::Verifying | update::Stage::Installing => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(if stage == update::Stage::Verifying {
+                            t!("Checking the checksum")
+                        } else {
+                            t!("Installing the update")
+                        });
+                    });
+                }
+                _ => {}
+            }
+
+            if stage != update::Stage::Checking {
+                if let Some(release) = &status.release {
+                    theme::section(ui, t!("What is new"));
+                    egui::ScrollArea::vertical()
+                        .id_salt("release-notes")
+                        .max_height(190.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            if release.notes.trim().is_empty() {
+                                ui.label(
+                                    RichText::new(t!("No release notes were published."))
+                                        .italics()
+                                        .color(muted),
+                                );
+                            } else {
+                                ui.label(RichText::new(release.notes.as_str()).size(11.5));
+                            }
+                        });
+                }
+            }
+
+            match status.verified {
+                Some(true) => {
+                    ui.label(
+                        RichText::new(format!("\u{2713} {}", t!("Checksum verified")))
+                            .size(11.0)
+                            .color(live),
+                    );
+                }
+                None if matches!(stage, update::Stage::Ready | update::Stage::Verifying) => {
+                    ui.label(
+                        RichText::new(t!("This package has no published checksum."))
+                            .size(11.0)
+                            .color(warn),
+                    );
+                }
+                _ => {}
+            }
+            if stage == update::Stage::Ready {
+                ui.label(RichText::new(t!(
+                    "ImGoSSH has to start again before the new version runs."
+                )));
+                if !status.replaced.is_empty() {
+                    ui.label(
+                        RichText::new(t!("{0} file(s) replaced", status.replaced.len()))
+                            .size(11.0)
+                            .color(muted),
+                    );
+                }
+                if !status.skipped.is_empty() {
+                    ui.label(
+                        RichText::new(t!("Could not replace: {0}", status.skipped.join(", ")))
+                            .size(11.0)
+                            .color(warn),
+                    );
+                }
+            }
+            if let Some(error) = &status.error {
+                ui.label(
+                    RichText::new(error.as_str())
+                        .size(11.5)
+                        .color(warn)
+                        .strong(),
+                );
+            }
+
+            ui.add_space(10.0);
+            theme::hairline(ui);
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                // The ways out that install nothing sit on the left.
+                match stage {
+                    update::Stage::Available => {
+                        if theme::ghost(ui, t!("Skip this version"))
+                            .on_hover_text(t!("Stop announcing it until a newer one appears"))
+                            .clicked()
+                        {
+                            outcome = UpdateOutcome::Skip(newest.clone().unwrap_or_default());
+                            dismiss = true;
+                        }
+                    }
+                    // The click that dismisses a button doubles as the guard, so
+                    // every way out reads the same way.
+                    update::Stage::Downloading | update::Stage::Verifying
+                        if theme::ghost(ui, t!("Cancel")).clicked() =>
+                    {
+                        outcome = UpdateOutcome::Cancel;
+                    }
+                    update::Stage::Failed if theme::ghost(ui, t!("Retry")).clicked() => {
+                        outcome = UpdateOutcome::Recheck;
+                    }
+                    _ => {}
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match stage {
+                        update::Stage::Available => {
+                            // A transfer in flight is the one thing that makes
+                            // swapping files a bad idea, so the button waits.
+                            ui.add_enabled_ui(blocked.is_none(), |ui| {
+                                if theme::primary(ui, t!("Update now")).clicked() {
+                                    outcome = UpdateOutcome::Update;
+                                }
+                            });
+                            if theme::ghost(ui, t!("Later")).clicked() {
+                                dismiss = true;
+                            }
+                            if theme::ghost(ui, t!("Open release page")).clicked() {
+                                ui.ctx()
+                                    .open_url(egui::OpenUrl::same_tab(release_url.as_str()));
+                            }
+                        }
+                        update::Stage::Ready => {
+                            if theme::primary(ui, t!("Restart now")).clicked() {
+                                outcome = UpdateOutcome::Relaunch;
+                                dismiss = true;
+                            }
+                        }
+                        update::Stage::Downloading
+                        | update::Stage::Verifying
+                        | update::Stage::Installing => {
+                            ui.label(RichText::new(t!("Working...")).size(11.5).color(muted));
+                        }
+                        update::Stage::Idle => {
+                            if theme::primary(ui, t!("Check now")).clicked() {
+                                outcome = UpdateOutcome::Recheck;
+                            }
+                        }
+                        update::Stage::Latest | update::Stage::Checking | update::Stage::Failed => {
+                            if theme::ghost(ui, t!("Close")).clicked() {
+                                dismiss = true;
+                            }
+                            if theme::ghost(ui, t!("Open release page")).clicked() {
+                                ui.ctx()
+                                    .open_url(egui::OpenUrl::same_tab(release_url.as_str()));
+                            }
+                        }
+                    }
+                });
+            });
+            if stage == update::Stage::Available {
+                if let Some(reason) = blocked {
+                    ui.label(RichText::new(reason).size(11.0).color(warn));
+                }
+            }
+        });
+
+    if dismiss {
+        *open = false;
+    }
+    outcome
 }
 
 /// Native "open" dialog used by the private-key browser button.

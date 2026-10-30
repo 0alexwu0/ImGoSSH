@@ -282,6 +282,49 @@ struct Run {
     dim: bool,
     underline: bool,
     selected: bool,
+    /// True when the cell is drawn by a glyph meant to fill it, which is
+    /// laid out with the other such glyphs of the row: see [`fills_cell`].
+    fills: bool,
+}
+
+/// The two jobs the glyphs of one row are laid out in: the letters, and the
+/// glyphs that are drawn as their whole cell.
+const LETTERS: usize = 0;
+const CELLS: usize = 1;
+
+/// Which of the two a run of cells belongs to.
+fn the_job(fills: bool) -> usize {
+    if fills {
+        CELLS
+    } else {
+        LETTERS
+    }
+}
+
+/// Whether `ch` is drawn as the cell it stands in rather than as a mark on the
+/// baseline.
+///
+/// The blocks and shades a progress bar is built from are cut to fill a cell
+/// from floor to ceiling, which is more than a line of text asks for: Consolas
+/// inks the shade behind a bar a sixth of a row past the top of it and still
+/// stops short of the floor. Laid out beside the letters they bleed into the rows
+/// either side, so a dashboard bar arrives with its background painted across
+/// the words above it. They are grouped and drawn apart instead, standing on the
+/// floor of their own row.
+fn fills_cell(ch: char) -> bool {
+    (0x2580..=0x259f).contains(&(ch as u32))
+}
+
+/// Whether a glyph that fills its cell hangs from the ceiling of it rather than
+/// standing on the floor.
+///
+/// Four glyphs of the block range are drawn from the top of the cell down: the
+/// upper half block, the upper eighth, and the two quadrants that have nothing
+/// under the middle line. For those the edge that has to meet the cell is the
+/// top one. Every other block, shade, eighth and quadrant is bounded below by
+/// the floor of the cell, which is where the row has to put it.
+fn hangs_from_the_ceiling(ch: char) -> bool {
+    matches!(ch, '\u{2580}' | '\u{2594}' | '\u{2598}' | '\u{259d}')
 }
 
 /// How far a group of cells may be laid out before the pen is snapped back onto
@@ -317,11 +360,13 @@ impl Guesses {
     }
 }
 
-/// Append one run of cells, closing a group as soon as the glyphs drift off the
-/// grid so that a wide fallback glyph, or a missing one, cannot take the rest of
-/// the row with it.
+/// Append one run of cells to whichever of the two jobs it belongs to, closing a
+/// group as soon as the glyphs drift off the grid so that a wide fallback glyph,
+/// or a missing one, cannot take the rest of the row with it.
+#[allow(clippy::too_many_arguments)]
 fn append_cells(
-    job: &mut LayoutJob,
+    jobs: &mut [LayoutJob; 2],
+    fills: bool,
     guesses: &mut Guesses,
     ctx: &Context,
     font: &FontId,
@@ -340,7 +385,7 @@ fn append_cells(
         if !text.is_empty()
             && (unknown || (guessed + advance - allotted - budget).abs() > MAX_DRIFT)
         {
-            close_group(job, ctx, &text, allotted, &format);
+            close_group(jobs, fills, ctx, &text, allotted, &format);
             text.clear();
             guessed = 0.0;
             allotted = 0.0;
@@ -349,24 +394,35 @@ fn append_cells(
         guessed += advance.max(0.0);
         allotted += budget;
         if unknown {
-            close_group(job, ctx, &text, allotted, &format);
+            close_group(jobs, fills, ctx, &text, allotted, &format);
             text.clear();
             guessed = 0.0;
             allotted = 0.0;
         }
     }
     if !text.is_empty() {
-        close_group(job, ctx, &text, allotted, &format);
+        close_group(jobs, fills, ctx, &text, allotted, &format);
     }
 }
 
 /// Lay `text` out once to learn how wide it really is, then append it with just
 /// enough space in front of its neighbour to leave the pen on a cell boundary.
-fn close_group(job: &mut LayoutJob, ctx: &Context, text: &str, allotted: f32, format: &TextFormat) {
+///
+/// Only one of the two jobs gets the glyphs; the other is walked past all the
+/// same, because the two pens have to go on agreeing about where a column is.
+fn close_group(
+    jobs: &mut [LayoutJob; 2],
+    fills: bool,
+    ctx: &Context,
+    text: &str,
+    allotted: f32,
+    format: &TextFormat,
+) {
     let mut measured = LayoutJob::default();
     measured.append(text, 0.0, format.clone());
     let width = ctx.fonts_mut(|fonts| fonts.layout_job(measured)).size().x;
-    job.append(text, allotted - width, format.clone());
+    jobs[the_job(fills)].append(text, allotted - width, format.clone());
+    jobs[the_job(!fills)].append("", allotted, format.clone());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -397,7 +453,7 @@ fn paint(
 
     for row in 0..rows {
         let y = rect.min.y + row as f32 * cell.y;
-        let mut job = LayoutJob::default();
+        let mut jobs = [LayoutJob::default(), LayoutJob::default()];
         let mut col = 0u16;
         while col < cols {
             let Some(first) = screen.cell(row, col) else {
@@ -462,7 +518,8 @@ fn paint(
                 color
             };
             append_cells(
-                &mut job,
+                &mut jobs,
+                run.fills,
                 guesses,
                 ctx,
                 &style.font,
@@ -477,9 +534,37 @@ fn paint(
             );
         }
 
-        if !job.text.is_empty() {
+        // The glyphs that fill a cell reach past the row they stand in, and a bar
+        // whose ink is let out of its row paints its background across the words
+        // above it and the words below. Every terminal cuts a cell to the grid it
+        // is drawn on, and so does this one - of those glyphs alone, because a
+        // row of letters is measured to sit in the middle of the band and asks to
+        // be allowed past it when the band is squeezed shorter than the face.
+        let band = Rect::from_min_size(Pos2::new(rect.min.x, y), Vec2::new(rect.width(), cell.y));
+        for fills in [false, true] {
+            let job = std::mem::take(&mut jobs[the_job(fills)]);
+            if job.text.is_empty() {
+                continue;
+            }
+            // Whatever stands on the floor of a cell among them decides which
+            // edge of the row the run is measured from: a run of nothing but
+            // upper halves has no bottom edge to aim at.
+            let on_the_floor = job.text.chars().any(|ch| !hangs_from_the_ceiling(ch));
             let galley = painter.layout_job(job);
-            painter.galley(Pos2::new(rect.min.x, y + inset), galley, default_fg);
+            // The glyphs that fill a cell are measured against the cell rather
+            // than against the line they stand in: left on the baseline an eighth
+            // block hangs into the row below, and a bar misses the floor.
+            let ink = galley.mesh_bounds;
+            let at = match (fills, on_the_floor, ink.is_finite()) {
+                (true, true, true) => Pos2::new(rect.min.x, y + cell.y - ink.max.y),
+                (true, false, true) => Pos2::new(rect.min.x, y - ink.min.y),
+                _ => Pos2::new(rect.min.x, y + inset),
+            };
+            if fills {
+                painter.with_clip_rect(band).galley(at, galley, default_fg);
+            } else {
+                painter.galley(at, galley, default_fg);
+            }
         }
     }
 
@@ -526,6 +611,7 @@ fn run_style(
         dim: c.dim(),
         underline: c.underline(),
         selected: selection.is_some_and(|s| s.contains(row, col)),
+        fills: c.contents().chars().next().is_some_and(fills_cell),
     }
 }
 // ---------------------------------------------------------------------------
@@ -1170,10 +1256,11 @@ mod tests {
         // A grinning face is in none of the text faces, so an emoji fallback
         // paints it - at an advance nothing like the terminal's.
         let cells = [('a', 1), ('\u{1f600}', 1), ('b', 1)];
-        let mut job = LayoutJob::default();
+        let mut jobs = [LayoutJob::default(), LayoutJob::default()];
         let mut guesses = Guesses::default();
         append_cells(
-            &mut job,
+            &mut jobs,
+            false,
             &mut guesses,
             &ctx,
             &font,
@@ -1181,7 +1268,7 @@ mod tests {
             &cells,
             TextFormat::default(),
         );
-        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(job));
+        let galley = ctx.fonts_mut(|fonts| fonts.layout_job(std::mem::take(&mut jobs[LETTERS])));
         let last = galley.rows[0]
             .glyphs
             .last()
@@ -1274,10 +1361,11 @@ mod tests {
         let font = FontId::monospace(14.0);
         let cell = ctx.fonts_mut(|fonts| fonts.glyph_width(&font, 'M'));
         let cells: Vec<(char, u16)> = "docker compose up".chars().map(|ch| (ch, 1)).collect();
-        let mut job = LayoutJob::default();
+        let mut jobs = [LayoutJob::default(), LayoutJob::default()];
         let mut guesses = Guesses::default();
         append_cells(
-            &mut job,
+            &mut jobs,
+            false,
             &mut guesses,
             &ctx,
             &font,
@@ -1285,7 +1373,11 @@ mod tests {
             &cells,
             TextFormat::default(),
         );
-        assert_eq!(job.sections.len(), 1, "an aligned run must not split");
+        assert_eq!(
+            jobs[LETTERS].sections.len(),
+            1,
+            "an aligned run must not split"
+        );
     }
 
     // One glyph from a fallback face used to drag every cell after it off its
@@ -1630,5 +1722,104 @@ mod tests {
                 drawn.dragging
             );
         }
+    }
+
+    // A bar is painted from glyphs that fill their whole cell, and a cell is not
+    // always as tall as the face that draws it: Consolas inks the shade behind a
+    // progress bar a sixth of a row past the top of the line it stands in, and an
+    // eighth block stands well below the baseline. Left on the baseline and
+    // unclipped, a monitoring program paints the background of every bar across
+    // the words above it, which is what a squeezed row does to a dashboard. So
+    // the glyphs that fill a cell stay inside their own row, measured against the
+    // cell rather than against the line they sit on.
+    #[test]
+    fn a_bar_is_painted_inside_the_row_it_is_on() {
+        let emu = Arc::new(Mutex::new(Emulator::new(4, 20, 0)));
+        let backend = Arc::new(Mutex::new(None));
+        let palette = Palette::default();
+        let shade = '\u{2591}';
+        let eighth = '\u{2581}';
+        emu.lock().unwrap().feed(
+            format!(
+                "Hxlp|_\r\n{}\r\n{}\r\ngjpq",
+                shade.to_string().repeat(20),
+                eighth.to_string().repeat(20)
+            )
+            .as_bytes(),
+        );
+        let font = FontId::monospace(14.0);
+        // A row with a point more than the face needs to set a line of this
+        // size: the bar has room to stand on the floor of its row and still be
+        // under the ceiling, whatever face happens to be installed.
+        let grid = pinned_grid(&font, Vec2::new(8.0, 17.0));
+        let style = Style {
+            font: font.clone(),
+            grid,
+            palette: &palette,
+            cursor_on: false,
+            pad: 0.0,
+            radius: 0.0,
+            border: Color32::TRANSPARENT,
+        };
+        let mut st = State::default();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                ..Default::default()
+            },
+            |ui| {
+                let _ = show(ui, &emu, &backend, &mut st, &style, false, None);
+            },
+        );
+        // There is no renderer here to apply the font texture to.
+        output.textures_delta.clear();
+
+        let mut bars = 0;
+        let mut words = 0;
+        for clipped in &output.shapes {
+            let egui::Shape::Text(painted) = &clipped.shape else {
+                continue;
+            };
+            let text = painted.galley.text();
+            if !text.chars().any(|ch| ch == shade || ch == eighth) {
+                // A row of letters is measured to sit in the middle of its band
+                // and is meant to be allowed past it: a terminal does not shave
+                // the tops off capitals or the tails off descenders to make a
+                // squeezed line fit, so only the glyphs that fill a cell are cut.
+                if text.contains("gjpq") {
+                    words += 1;
+                    assert!(
+                        clipped.clip_rect.height() > grid.cell.y,
+                        "a row of letters was cut to its own band"
+                    );
+                }
+                continue;
+            }
+            bars += 1;
+            let ink = painted.galley.mesh_bounds;
+            let row = clipped.clip_rect;
+            let top = painted.pos.y + ink.min.y;
+            let bottom = painted.pos.y + ink.max.y;
+            assert!(
+                top >= row.min.y - 0.01,
+                "a bar inks {} points into the row above it",
+                row.min.y - top
+            );
+            assert!(
+                bottom <= row.max.y + 0.01,
+                "a bar inks {} points into the row below it",
+                bottom - row.max.y
+            );
+            // A bar that stops short of the floor leaves a slit of background
+            // under it, which is as wrong as spilling over it.
+            assert!(
+                bottom >= row.max.y - 0.01,
+                "a bar stands {} points above the floor of its row",
+                row.max.y - bottom
+            );
+        }
+        assert_eq!(bars, 2, "the two rows of blocks were not both painted");
+        assert_eq!(words, 1, "the row of letters was not painted");
     }
 }

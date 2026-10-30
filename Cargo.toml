@@ -52,14 +52,29 @@ portable-pty = "0.9"
 arboard = "3"
 rfd = "0.15"
 crossterm = "0.28"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+serde_json = "1"
+ring = "0.17"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# The application icon is a bitmap: `src/icon.rs` decodes it and shrinks it for
+# the window, the brand mark, and - through the build script - the .ico.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 # The colour of the title bar is the operating system's to paint; see
 # `ui::chrome`.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 
+# The Linux release is a .tar.gz; the other platforms ship plain zip archives.
+[target.'cfg(target_os = "linux")'.dependencies]
+tar = "0.4"
+flate2 = "1"
+
 [profile.release]
 opt-level = 2
 lto = "thin"
 codegen-units = 16
-

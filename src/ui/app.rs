@@ -26,6 +26,7 @@ use crate::ui::dialogs::{self, ChallengeBuffer};
 use crate::ui::sidebar::{self, Sidebar};
 use crate::ui::terminal::{self as term_widget, Grid, Style as TermStyle};
 use crate::ui::theme;
+use crate::update;
 use crate::util::{human_rate, human_size, human_uptime};
 
 /// How far a tab has got.
@@ -149,6 +150,17 @@ pub struct App {
     show_settings: bool,
     show_transfers: bool,
     show_about: bool,
+    /// The online updater: what GitHub last said, and how a download is going.
+    updater: update::Updater,
+    show_update: bool,
+    /// The answer already folded into the settings file, so one check is
+    /// written once rather than on every frame.
+    update_seen: Option<std::time::SystemTime>,
+    /// When a check last failed. A machine with no network should be asked
+    /// again in a few minutes, not on every frame.
+    update_failed_at: Option<std::time::SystemTime>,
+    /// Set once the new binaries are on disk: `on_exit` starts the program.
+    restarting: bool,
     /// The native window frame, kept the same colour as the panels.
     chrome: chrome::Chrome,
     term_menu: Option<(egui::Pos2, usize)>,
@@ -179,6 +191,9 @@ impl App {
     /// Build the shell and queue whatever the command line asked for.
     pub fn with_startup(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
         let store = Store::load();
+        // The copies a previous update moved aside go now, while nothing is
+        // holding them open.
+        update::cleanup_backups();
         i18n::set(resolve_lang(&store.config.language));
         let palette = store.config.palette();
         let font = FontId::monospace(store.config.font_size);
@@ -215,6 +230,11 @@ impl App {
             show_settings: false,
             show_transfers: false,
             show_about: false,
+            updater: update::Updater::new(),
+            show_update: false,
+            update_seen: None,
+            update_failed_at: None,
+            restarting: false,
             chrome: chrome::Chrome::default(),
             term_menu: None,
             term_menu_fresh: false,
@@ -1002,6 +1022,7 @@ impl eframe::App for App {
             dark: tokens.dark,
         });
         self.poll_prompts();
+        self.poll_updater(ctx);
         if self.poll_connections() {
             // A session that went away is worth announcing now rather than the
             // next time the window is touched.
@@ -1009,6 +1030,10 @@ impl eframe::App for App {
         }
         if self.queue.active() > 0 && !self.show_transfers {
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        // A download paints a moving bar, so it asks for its own frames.
+        if self.updater.status().busy() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
         // A session that is supposed to be running is worth another look even
         // while nobody types: a peer that dies outright can leave the shell
@@ -1091,6 +1116,9 @@ impl eframe::App for App {
     fn on_exit(&mut self) {
         if let Err(err) = self.store.save() {
             log::warn!("saving settings: {err}");
+        }
+        if self.restarting {
+            update::relaunch();
         }
     }
 }
@@ -1195,6 +1223,52 @@ impl App {
             if let Some(ctx) = self.ctx.clone() {
                 ctx.request_repaint();
             }
+        }
+    }
+
+    /// Fold what the update worker last said into the settings, and ask again
+    /// once the answer has gone stale. A first frame that has never asked is
+    /// what starts the startup check, so there is only one path to follow.
+    fn poll_updater(&mut self, ctx: &Context) {
+        let status = self.updater.status();
+        if status.checked_at != self.update_seen {
+            self.update_seen = status.checked_at;
+            let now = std::time::SystemTime::now();
+            if status.error.is_some() {
+                // An answer that never arrived is not worth writing down - it
+                // would buy six hours of silence after one missed flight. It is
+                // worth remembering for a few minutes, so that a laptop with no
+                // signal is not left asking again on every frame.
+                self.update_failed_at = Some(now);
+            } else {
+                self.update_failed_at = None;
+                if let Some(checked) = status.checked_at {
+                    self.store.config.last_update_check = update::epoch_seconds(checked);
+                    self.dirty = true;
+                }
+            }
+        }
+        if self.updater.busy() || !update::is_due(&self.store.config) {
+            return;
+        }
+        const RETRY: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+        let due_again = self.update_failed_at.is_none_or(|failed| {
+            std::time::SystemTime::now()
+                .duration_since(failed)
+                .map_or(true, |gone| gone >= RETRY)
+        });
+        if due_again {
+            self.updater.check(ctx);
+        }
+    }
+
+    /// Close the window with the new binaries already on disk; `on_exit` starts
+    /// the program they belong to.
+    fn restart_for_update(&mut self) {
+        self.restarting = true;
+        self.show_update = false;
+        if let Some(ctx) = self.ctx.clone() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
@@ -1573,9 +1647,75 @@ impl App {
                         open_in_file_manager(&dir);
                         ui.close();
                     }
+                    ui.separator();
+                    if ui.button(t!("Check for updates...")).clicked() {
+                        self.show_update = true;
+                        // A manual check means the user wants an answer now, so
+                        // the six-hour rule is set aside; a running download is
+                        // left alone because `check` will not interrupt it.
+                        self.updater.check(&ctx);
+                        ui.close();
+                    }
+                });
+
+                // The notice belongs to the bar itself, not to a menu: a new
+                // version should be seen without anybody hunting for it.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.update_notice(ui);
                 });
             });
         });
+    }
+
+    /// The notice at the right end of the menu bar: quiet unless something can
+    /// be acted on, and silent about a version the user chose to skip.
+    fn update_notice(&mut self, ui: &mut Ui) {
+        let status = self.updater.status();
+        let muted = theme::muted(ui);
+        let (text, hovered) = match status.stage {
+            update::Stage::Available => {
+                let version = status.available();
+                if version
+                    .as_ref()
+                    .is_some_and(|version| update::is_skipped(&self.store.config, version))
+                {
+                    return;
+                }
+                let label = match &version {
+                    Some(version) => t!("New version {0}", version.text()).to_string(),
+                    None => t!("Update available").to_string(),
+                };
+                (label, t!("Click to see what is new"))
+            }
+            update::Stage::Ready => (
+                t!("Restart to finish").to_string(),
+                t!("The new version is installed"),
+            ),
+            update::Stage::Downloading => (
+                t!("Downloading {0}%", (status.percent() * 100.0) as i32).to_string(),
+                t!("Click to watch the download"),
+            ),
+            update::Stage::Verifying => (
+                t!("Checking the checksum").to_string(),
+                t!("Click to watch the update"),
+            ),
+            update::Stage::Installing => (
+                t!("Installing the update").to_string(),
+                t!("Click to watch the update"),
+            ),
+            _ => return,
+        };
+        let noticed = if matches!(
+            status.stage,
+            update::Stage::Available | update::Stage::Ready
+        ) {
+            theme::primary(ui, egui::RichText::new(text).size(11.5))
+        } else {
+            theme::ghost(ui, egui::RichText::new(text).size(11.5).color(muted))
+        };
+        if noticed.on_hover_text(hovered).clicked() {
+            self.show_update = true;
+        }
     }
 
     fn tool_bar(&mut self, ui: &mut Ui) {
@@ -2279,13 +2419,13 @@ fn tab_button(
 /// hit target, and the accent border only shows when the pointer is on it.
 fn welcome_row(ui: &mut Ui, width: f32, glyph: &str, title: &str, detail: &str) -> bool {
     let v = ui.visuals();
-    let (border, hover_border, face, hover_face, accent_dim, accent_text, muted, text) = (
+    let (border, hover_border, face, hover_face, accent_dim, on_dim, muted, text) = (
         v.widgets.noninteractive.bg_stroke.color,
         theme::accent(ui),
         v.widgets.inactive.weak_bg_fill,
         v.widgets.hovered.weak_bg_fill,
         theme::accent_dim(ui),
-        theme::accent_text(ui),
+        theme::accent(ui),
         theme::muted(ui),
         v.text_color(),
     );
@@ -2309,7 +2449,7 @@ fn welcome_row(ui: &mut Ui, width: f32, glyph: &str, title: &str, detail: &str) 
         Align2::CENTER_CENTER,
         glyph,
         FontId::proportional(16.0),
-        accent_text,
+        on_dim,
     );
     let x = tile.right() + 13.0;
     ui.painter().text(
@@ -2474,6 +2614,8 @@ impl App {
     fn dialogs(&mut self, ctx: &Context) {
         let mut close_transfers = false;
         let mut close_about = false;
+        let update_status = self.updater.status();
+        let mut update_outcome = dialogs::UpdateOutcome::Nothing;
         egui::Area::new(egui::Id::new("dialogs"))
             .order(egui::Order::Foreground)
             .fixed_pos(egui::Pos2::ZERO)
@@ -2499,7 +2641,32 @@ impl App {
                 if self.show_about {
                     close_about = dialogs::about_dialog(ui);
                 }
+                if self.show_update {
+                    let mut open = true;
+                    // Bytes still moving through SFTP would have the file under
+                    // them swapped for another program's, so the update waits
+                    // for the queue to empty.
+                    let blocked = (self.queue.active() > 0)
+                        .then(|| t!("Finish or cancel the transfers first").to_string());
+                    update_outcome =
+                        dialogs::update_dialog(ui, &update_status, blocked.as_deref(), &mut open);
+                    if !open {
+                        self.show_update = false;
+                    }
+                }
             });
+        match update_outcome {
+            dialogs::UpdateOutcome::Update => self.updater.install(ctx),
+            dialogs::UpdateOutcome::Cancel => self.updater.cancel(),
+            dialogs::UpdateOutcome::Recheck => self.updater.check(ctx),
+            dialogs::UpdateOutcome::Relaunch => self.restart_for_update(),
+            dialogs::UpdateOutcome::Skip(version) => {
+                self.store.config.skipped_version = version;
+                self.show_update = false;
+                self.dirty = true;
+            }
+            dialogs::UpdateOutcome::Nothing => {}
+        }
         if close_transfers {
             self.show_transfers = false;
         }

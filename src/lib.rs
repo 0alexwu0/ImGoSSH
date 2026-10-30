@@ -8,6 +8,7 @@
 //! * [`terminal`] - UI-agnostic VT100 emulation, key and mouse encoding.
 //! * [`icon`] - the painted application icon, shared with `build.rs`.
 //! * [`line_drawing`] - the DEC special graphics set, turned into box characters.
+//! * [`update`] - the online updater: the newest release on GitHub, installed in place.
 //! * [`ui`] - the egui/eframe front-end (tabs, sidebar, file browser, dialogs).
 //!
 //! The same engine powers the command line tools (`igssh`, `igscp`, `igsftp`).
@@ -20,6 +21,7 @@ pub mod line_drawing;
 pub mod ssh;
 pub mod terminal;
 pub mod ui;
+pub mod update;
 pub mod util;
 
 /// Things every binary and UI module needs.

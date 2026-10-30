@@ -17,6 +17,11 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPOSITORY_URL: &str = "https://github.com/0alexwu0/ImGoSSH";
 /// Who wrote it, as the about window says.
 pub const APP_AUTHOR: &str = "Alex.Wu";
+/// The GitHub API answer for the newest published release, which is what an
+/// online update is compared against.
+pub const RELEASE_API_URL: &str = "https://api.github.com/repos/0alexwu0/ImGoSSH/releases/latest";
+/// Every published build, for when an update has to be run by hand.
+pub const RELEASES_URL: &str = "https://github.com/0alexwu0/ImGoSSH/releases";
 
 /// Where settings live. `IMGOSSH_HOME` overrides it (handy for portable use).
 pub fn store_dir() -> PathBuf {
@@ -286,6 +291,8 @@ impl Default for Palette {
 impl Palette {
     /// The built-in palettes. An unknown name falls back to [`Palette::default`].
     pub fn preset(name: &str) -> Palette {
+        // Tango, for the light ground: hues that have to stay legible on
+        // white, and which the default palette below borrows only the shape of.
         let base: [[u8; 3]; 16] = [
             [0x2e, 0x34, 0x36],
             [0xcc, 0x00, 0x00],
@@ -365,12 +372,41 @@ impl Palette {
                     [0xff, 0xff, 0xff],
                 ],
             },
+            // The default, and the one the interface is dressed with: the
+            // terminal the cat is curled around, cut out of the same navy as
+            // the tile it sleeps on - `(10, 19, 33)` to `(19, 36, 61)` across
+            // the glass. The ink is the `SSH` of the prompt, a cool white
+            // rather than the warm grey a charcoal ground wants.
+            //
+            // Only the colours the picture has an opinion about move: the two
+            // greys that stand in for the ground, and the blue and cyan that
+            // are the glow on the tile's rim and the prompt itself. Red, green,
+            // yellow, magenta stay Tango, because a `ls --color` or a vim
+            // scheme out there means something, and repainting it to match a
+            // logo would be the icon telling the server what to say.
             _ => Palette {
-                foreground: [0xd5, 0xd8, 0xdc],
-                background: [0x14, 0x17, 0x1a],
-                cursor: [0xae, 0xaf, 0xb0],
-                selection: [0x2d, 0x4f, 0x78],
-                ansi: base,
+                foreground: [0xd7, 0xe0, 0xe8],
+                background: [0x0d, 0x15, 0x20],
+                cursor: [0x25, 0xc7, 0xf6],
+                selection: [0x12, 0x45, 0x6a],
+                ansi: [
+                    [0x1e, 0x2b, 0x3a],
+                    [0xcc, 0x00, 0x00],
+                    [0x26, 0xa2, 0x66],
+                    [0xc4, 0xa0, 0x00],
+                    [0x2e, 0x6f, 0xbe],
+                    [0x75, 0x50, 0x7b],
+                    [0x1f, 0xb6, 0xd8],
+                    [0xd3, 0xdb, 0xe2],
+                    [0x55, 0x67, 0x7c],
+                    [0xef, 0x29, 0x29],
+                    [0x4e, 0x9a, 0x06],
+                    [0xc4, 0xa0, 0x00],
+                    [0x6f, 0xa8, 0xe8],
+                    [0xad, 0x7f, 0xa8],
+                    [0x4a, 0xe6, 0xf7],
+                    [0xf2, 0xf6, 0xf9],
+                ],
             },
         }
     }
@@ -429,6 +465,13 @@ pub struct Config {
     pub store_passwords: bool,
     pub window_width: f32,
     pub window_height: f32,
+    /// Ask GitHub for a newer release on startup and every few hours after.
+    pub check_updates: bool,
+    /// A version the user chose to stop hearing about, `0.1.4` for instance.
+    pub skipped_version: String,
+    /// When a release check last finished, in seconds since the epoch, so that
+    /// reopening the app does not immediately ask the same question again.
+    pub last_update_check: i64,
 }
 
 impl Default for Config {
@@ -469,6 +512,9 @@ impl Default for Config {
             store_passwords: true,
             window_width: 1200.0,
             window_height: 760.0,
+            check_updates: true,
+            skipped_version: String::new(),
+            last_update_check: 0,
         }
     }
 }

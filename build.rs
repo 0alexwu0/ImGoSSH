@@ -1,6 +1,6 @@
 //! Gives `imgossh.exe` a Windows icon of its own.
 //!
-//! The pixels come from `src/icon.rs` - the very same painter the window uses at
+//! The pixels come from `src/icon.rs` - the very same asset the window shrinks at
 //! runtime - and are assembled into a multi-size `.ico`, compiled by the SDK's
 //! `rc.exe`, and handed to the linker as a `.res`. Everything here is best
 //! effort: a machine without the Windows SDK gets a warning and the stock icon
@@ -18,6 +18,7 @@ const SIZES: [u32; 6] = [16, 24, 32, 48, 64, 256];
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/icon.rs");
+    println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-env-changed=IMGOSSH_RC");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
