@@ -2837,35 +2837,28 @@ impl App {
             return;
         };
         let mut action: Option<u8> = None;
-        let response = egui::Window::new("Terminal")
-            .id(egui::Id::new("terminal-menu"))
-            .title_bar(false)
-            .collapsible(false)
-            .resizable(false)
-            .constrain(false)
-            .current_pos(pos)
-            .show(ui.ctx(), |ui| {
-                if ui.button(t!("Copy\tCtrl+Shift+C")).clicked() {
-                    action = Some(0);
-                }
-                if ui.button(t!("Paste\tCtrl+Shift+V")).clicked() {
-                    action = Some(1);
-                }
-                ui.separator();
-                if ui.button(t!("Select all")).clicked() {
-                    action = Some(2);
-                }
-                if ui.button(t!("Scroll to bottom")).clicked() {
-                    action = Some(3);
-                }
-                ui.separator();
-                if ui.button(t!("Toggle SFTP browser")).clicked() {
-                    action = Some(4);
-                }
-                if ui.button(t!("Close tab\tCtrl+Shift+W")).clicked() {
-                    action = Some(5);
-                }
-            });
+        let response = terminal_menu_window(pos).show(ui.ctx(), |ui| {
+            if ui.button(t!("Copy\tCtrl+Shift+C")).clicked() {
+                action = Some(0);
+            }
+            if ui.button(t!("Paste\tCtrl+Shift+V")).clicked() {
+                action = Some(1);
+            }
+            ui.separator();
+            if ui.button(t!("Select all")).clicked() {
+                action = Some(2);
+            }
+            if ui.button(t!("Scroll to bottom")).clicked() {
+                action = Some(3);
+            }
+            ui.separator();
+            if ui.button(t!("Toggle SFTP browser")).clicked() {
+                action = Some(4);
+            }
+            if ui.button(t!("Close tab\tCtrl+Shift+W")).clicked() {
+                action = Some(5);
+            }
+        });
         let Some(inner) = response else { return };
         let rect = inner.response.rect;
 
@@ -2909,6 +2902,18 @@ impl App {
             _ => {}
         }
     }
+}
+
+fn terminal_menu_window(pos: egui::Pos2) -> egui::Window<'static> {
+    egui::Window::new("Terminal")
+        .id(egui::Id::new("terminal-menu"))
+        .title_bar(false)
+        .collapsible(false)
+        .resizable(false)
+        // Keep every menu item inside the viewport, including when opened
+        // near the bottom or right edge of the terminal.
+        .constrain(true)
+        .current_pos(pos)
 }
 
 /// Should the open terminal menu be gone by the end of this frame?
@@ -3220,5 +3225,48 @@ mod tests {
             !menu_is_dismissed(None, true, true, true),
             "the right-click that opened the menu must not close it again"
         );
+    }
+
+    #[test]
+    fn terminal_menu_stays_inside_the_viewport_at_the_edges() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        for pos in [
+            screen.right_bottom() - Vec2::splat(2.0),
+            egui::pos2(30.0, 598.0),
+        ] {
+            let ctx = Context::default();
+            let mut rect = egui::Rect::NOTHING;
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(screen),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        rect = terminal_menu_window(pos)
+                            .show(ui.ctx(), |ui| {
+                                for text in [
+                                    "Copy\tCtrl+Shift+C",
+                                    "Paste\tCtrl+Shift+V",
+                                    "Select all",
+                                    "Scroll to bottom",
+                                    "Toggle SFTP browser",
+                                    "Close tab\tCtrl+Shift+W",
+                                ] {
+                                    let _ = ui.button(text);
+                                }
+                            })
+                            .unwrap()
+                            .response
+                            .rect;
+                    },
+                );
+                output.textures_delta.clear();
+            }
+            assert!(
+                screen.expand(1.0).contains_rect(rect),
+                "menu at {pos:?} is clipped: {rect:?}"
+            );
+        }
     }
 }

@@ -21,8 +21,6 @@ use crate::util::{human_rate, human_size, human_time, remote_join};
 
 /// How long a finished transfer stays on the progress strip.
 const KEEP_FINISHED: std::time::Duration = std::time::Duration::from_secs(2);
-/// How many transfers the strip shows before it says "and N more".
-const SHOWN_JOBS: usize = 2;
 
 /// One row of the local pane.
 #[derive(Debug, Clone)]
@@ -317,6 +315,17 @@ impl Browser {
         });
     }
 
+    fn upload_path(&mut self, conn: &Connection, queue: &Queue, path: PathBuf) {
+        let into = self.path.clone();
+        if path.is_dir() {
+            for job in queue.upload_files(conn.clone(), path, into, true) {
+                self.track(job);
+            }
+        } else {
+            self.track(queue.upload(conn.clone(), path, into, false));
+        }
+    }
+
     /// Re-read both panes - the toolbar button and the blank-area menu share it.
     fn refresh(&mut self, conn: Option<&Connection>) {
         if let Some(conn) = conn {
@@ -358,11 +367,8 @@ impl Browser {
         else {
             return;
         };
-        let into = self.path.clone();
         for path in paths {
-            let is_dir = path.is_dir();
-            let job = queue.upload(conn.clone(), path, into.clone(), is_dir);
-            self.track(job);
+            self.upload_path(conn, queue, path);
         }
     }
 
@@ -409,71 +415,79 @@ impl Browser {
             .iter()
             .map(|tracked| (tracked.job.clone(), tracked.job.snapshot()))
             .collect();
-        let rest = live.len().saturating_sub(SHOWN_JOBS);
-        for (job, state) in live.iter().take(SHOWN_JOBS) {
-            let name = if state.current.is_empty() {
-                job.source.clone()
-            } else {
-                state.current.clone()
-            };
-            let running = !state.phase.is_finished();
-            let glyph = match state.phase {
-                Phase::Done => "\u{2713}",
-                Phase::Cancelled => "\u{2212}",
-                Phase::Failed(_) => "\u{26a0}",
-                Phase::Queued => "\u{23f8}",
-                Phase::Running => "\u{2026}",
-            };
-            let text = t!(
-                "{0} - {1} / {2} - {3}",
-                state.phase.label(),
-                human_size(state.done),
-                human_size(state.total),
-                human_rate(state.rate())
-            );
-            let mut cancel = false;
-            ui.horizontal(|ui| {
-                ui.label(
-                    RichText::new(job.direction.arrow())
-                        .size(11.5)
-                        .color(accent),
-                );
-                ui.add(egui::Label::new(RichText::new(name).size(11.5).color(muted)).truncate());
-                let right =
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if running {
-                            theme::ghost(ui, "\u{2715}")
-                                .on_hover_text(t!("Cancel this transfer"))
-                                .clicked()
-                        } else {
-                            ui.label(RichText::new(glyph).size(11.5).color(muted));
-                            false
-                        }
+        egui::ScrollArea::vertical()
+            .id_salt("browser-transfers")
+            .max_height((ui.available_height() * 0.35).min(180.0))
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (job, state) in &live {
+                    let name = if state.current.is_empty() {
+                        job.source.clone()
+                    } else {
+                        state.current.clone()
+                    };
+                    let running = !state.phase.is_finished();
+                    let glyph = match state.phase {
+                        Phase::Done => "\u{2713}",
+                        Phase::Cancelled => "\u{2212}",
+                        Phase::Failed(_) => "\u{26a0}",
+                        Phase::Queued => "\u{23f8}",
+                        Phase::Running => "\u{2026}",
+                    };
+                    let text = t!(
+                        "{0} - {1} / {2} - {3}",
+                        state.phase.label(),
+                        human_size(state.done),
+                        human_size(state.total),
+                        human_rate(state.rate())
+                    );
+                    let mut cancel = false;
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(job.direction.arrow())
+                                .size(11.5)
+                                .color(accent),
+                        );
+                        ui.add(
+                            egui::Label::new(RichText::new(&name).size(11.5).color(muted))
+                                .truncate(),
+                        )
+                        .on_hover_text(&name);
+                        let right = ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if running {
+                                    theme::ghost(ui, "\u{2715}")
+                                        .on_hover_text(t!("Cancel this transfer"))
+                                        .clicked()
+                                } else {
+                                    ui.label(RichText::new(glyph).size(11.5).color(muted));
+                                    false
+                                }
+                            },
+                        );
+                        cancel = right.inner;
                     });
-                cancel = right.inner;
+                    if cancel {
+                        job.cancel();
+                    }
+                    // The label rides on top of the bar rather than inside it, so the
+                    // numbers stay readable while the fill runs underneath them.
+                    let tone = match state.phase {
+                        Phase::Done => good,
+                        Phase::Failed(_) => bad,
+                        Phase::Cancelled => muted,
+                        _ => accent,
+                    };
+                    theme::meter(
+                        ui,
+                        state.percent() / 100.0,
+                        ui.available_width(),
+                        text,
+                        tone,
+                    );
+                }
             });
-            if cancel {
-                job.cancel();
-            }
-            // The label rides on top of the bar rather than inside it, so the
-            // numbers stay readable while the fill runs underneath them.
-            let tone = match state.phase {
-                Phase::Done => good,
-                Phase::Failed(_) => bad,
-                Phase::Cancelled => muted,
-                _ => accent,
-            };
-            theme::meter(
-                ui,
-                state.percent() / 100.0,
-                ui.available_width(),
-                text,
-                tone,
-            );
-        }
-        if rest > 0 {
-            ui.label(RichText::new(t!("+{0} more", rest)).size(11.0).color(muted));
-        }
     }
 
     fn matches_filter(&self, name: &str) -> bool {
@@ -695,9 +709,7 @@ impl Browser {
                 conn,
                 self.local_selected.and_then(|i| self.local.get(i).cloned()),
             ) {
-                let into = self.path.clone();
-                let job = queue.upload(conn.clone(), entry.path, into, entry.is_dir);
-                self.track(job);
+                self.upload_path(conn, queue, entry.path);
             }
         }
         if local.rename {
@@ -727,11 +739,8 @@ impl Browser {
         });
         if !dropped.is_empty() {
             if let Some(conn) = conn {
-                let into = self.path.clone();
                 for path in dropped {
-                    let is_dir = path.is_dir();
-                    let job = queue.upload(conn.clone(), path, into.clone(), is_dir);
-                    self.track(job);
+                    self.upload_path(conn, queue, path);
                 }
             }
         }

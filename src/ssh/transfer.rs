@@ -304,6 +304,74 @@ impl Queue {
         });
         job
     }
+
+    /// Queue one independent transfer for every file in a local folder.  The
+    /// queue and the UI can therefore show a real progress row per file,
+    /// instead of one row whose size is overwritten as recursion advances.
+    pub fn upload_files(
+        &self,
+        conn: Connection,
+        local: PathBuf,
+        remote_dir: String,
+        recursive: bool,
+    ) -> Vec<Job> {
+        let root = if recursive {
+            remote_join(
+                &remote_dir,
+                &local.file_name().unwrap_or_default().to_string_lossy(),
+            )
+        } else {
+            remote_dir.clone()
+        };
+        let mut files = Vec::new();
+        if let Err(err) = collect_local_files(&local, &root, &mut files) {
+            let job = self.push(Direction::Upload, local.display().to_string(), root);
+            let mut state = job.state.lock().unwrap();
+            state.phase = Phase::Failed(format!("{err:#}"));
+            state.finished = Some(Instant::now());
+            drop(state);
+            return vec![job];
+        }
+        let jobs: Vec<_> = files
+            .iter()
+            .map(|file| {
+                let job = self.push(
+                    Direction::Upload,
+                    file.local.display().to_string(),
+                    file.remote.clone(),
+                );
+                let mut state = job.state.lock().unwrap();
+                state.total = file.size.unwrap_or(0);
+                state.current = file.remote.clone();
+                drop(state);
+                job
+            })
+            .collect();
+        let workers = jobs.clone();
+        tokio::spawn(async move {
+            // Keep the folder's transfers sequential, just as tree uploads
+            // were before, while exposing every queued file independently.
+            for (file, job) in files.into_iter().zip(workers) {
+                run(
+                    job.state.clone(),
+                    job.cancel.clone(),
+                    Direction::Upload,
+                    async {
+                        let sftp = conn.sftp().await?;
+                        if file.size.is_none() {
+                            mkdir_all(&sftp, &file.remote).await
+                        } else {
+                            mkdir_all(&sftp, &crate::util::remote_parent(&file.remote)).await?;
+                            upload_file(&sftp, &file.local, &file.remote, &job.state, &job.cancel)
+                                .await
+                        }
+                    },
+                )
+                .await;
+            }
+        });
+        jobs
+    }
 }
 
 /// SFTP has no `mkdir -p`, so walk down from the first existing ancestor.
@@ -339,6 +407,41 @@ fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".into())
+}
+
+struct UploadFile {
+    local: PathBuf,
+    remote: String,
+    /// `None` is an empty directory, which still needs to be created.
+    size: Option<u64>,
+}
+
+fn collect_local_files(dir: &Path, remote_dir: &str, out: &mut Vec<UploadFile>) -> Result<()> {
+    let mut entries = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+    entries.sort_by_key(|e| e.file_name());
+    if entries.is_empty() {
+        out.push(UploadFile {
+            local: dir.to_path_buf(),
+            remote: remote_dir.to_owned(),
+            size: None,
+        });
+    }
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let remote = remote_join(remote_dir, &name);
+        let metadata = std::fs::metadata(&path)?;
+        if metadata.is_dir() {
+            collect_local_files(&path, &remote, out)?;
+        } else {
+            out.push(UploadFile {
+                local: path,
+                remote,
+                size: Some(metadata.len()),
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn run<F>(state: Arc<Mutex<Progress>>, cancel: Arc<AtomicBool>, direction: Direction, fut: F)
@@ -493,4 +596,49 @@ async fn push_tree(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_upload_lists_every_file_with_its_own_size_and_keeps_empty_dirs() {
+        let dir = std::env::temp_dir().join(format!(
+            "imgossh-upload-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("nested/empty")).unwrap();
+        std::fs::write(dir.join("a.txt"), b"abc").unwrap();
+        std::fs::write(dir.join("nested/b.txt"), b"1234567").unwrap();
+        std::fs::write(dir.join("zero.txt"), b"").unwrap();
+        let mut files = Vec::new();
+        collect_local_files(&dir, "/dest/folder", &mut files).unwrap();
+        let planned: Vec<_> = files
+            .iter()
+            .map(|file| (file.remote.as_str(), file.size))
+            .collect();
+        assert_eq!(
+            planned,
+            vec![
+                ("/dest/folder/a.txt", Some(3)),
+                ("/dest/folder/nested/b.txt", Some(7)),
+                ("/dest/folder/nested/empty", None),
+                ("/dest/folder/zero.txt", Some(0)),
+            ]
+        );
+        assert_eq!(files.iter().filter_map(|file| file.size).sum::<u64>(), 10);
+        let missing = dir.join("missing");
+        assert!(collect_local_files(&missing, "/dest/missing", &mut Vec::new()).is_err());
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        std::fs::remove_file(dir.join("zero.txt")).unwrap();
+        std::fs::remove_file(dir.join("nested/b.txt")).unwrap();
+        std::fs::remove_dir(dir.join("nested/empty")).unwrap();
+        std::fs::remove_dir(dir.join("nested")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

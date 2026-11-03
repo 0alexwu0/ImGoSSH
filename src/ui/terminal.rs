@@ -720,22 +720,6 @@ pub fn show(
         });
     }
 
-    {
-        let term = emu.lock().unwrap();
-        paint(
-            &ui.painter_at(rect),
-            ui.ctx(),
-            cells,
-            &term,
-            style,
-            &mut st.guesses,
-            st.selection,
-            rows,
-            cols,
-            term.scroll_offset,
-            focused,
-        );
-    }
     if let Some(notice) = notice {
         out.restart = notice_strip(ui, notice, style, well, strip);
     }
@@ -809,7 +793,8 @@ pub fn show(
                 }
             }
         }
-    } else if st.dragging || st.reported_button.is_some() {
+    }
+    if st.dragging || st.reported_button.is_some() {
         // Keep tracking even if the pointer wanders off the last row.
         if let Some(cell) = active_cell {
             if let Some(button) = st.reported_button {
@@ -872,6 +857,25 @@ pub fn show(
     if st.want_focus {
         st.want_focus = false;
         response.request_focus();
+    }
+
+    // Paint after input so a drag's new endpoint is visible in this frame,
+    // even when the pointer stops moving before the next repaint.
+    {
+        let term = emu.lock().unwrap();
+        paint(
+            &ui.painter_at(rect),
+            ui.ctx(),
+            cells,
+            &term,
+            style,
+            &mut st.guesses,
+            st.selection,
+            rows,
+            cols,
+            term.scroll_offset,
+            focused,
+        );
     }
 
     out
@@ -1515,6 +1519,7 @@ mod tests {
         out: Output,
         /// A press inside the cells starts a selection drag.
         dragging: bool,
+        selection: Option<Selection>,
         /// Every run of text the widget painted, with the height of its top.
         text: Vec<(String, f32)>,
         /// Every box the widget painted, filled or not.
@@ -1585,6 +1590,7 @@ mod tests {
                 grid: Vec2::new(cols as f32, rows as f32),
                 out,
                 dragging: st.dragging,
+                selection: st.selection,
                 text,
                 boxes,
             });
@@ -1597,6 +1603,63 @@ mod tests {
     /// One frame of [`frames`].
     fn drawn(notice: Option<&Notice>, events: Vec<egui::Event>) -> Drawn {
         frames(notice, vec![events])
+    }
+
+    #[test]
+    fn selection_is_updated_and_painted_while_the_mouse_is_held() {
+        for (start, end) in [((0, 2), (0, 6)), ((0, 6), (0, 2)), ((0, 2), (1, 4))] {
+            let position =
+                |(row, col): (u16, u16)| Pos2::new(col as f32 * 8.0 + 4.0, row as f32 * 16.0 + 8.0);
+            let press = egui::Event::PointerButton {
+                pos: position(start),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let passes = vec![
+                vec![],
+                vec![egui::Event::PointerMoved(position(start)), press],
+                vec![egui::Event::PointerMoved(position(end))],
+            ];
+            let selected = Selection { start, end };
+            let normalized = selected.normalized();
+            let last_col = if start.0 == end.0 {
+                normalized.end.1
+            } else {
+                79
+            };
+            let expected = Rect::from_min_max(
+                Pos2::new(normalized.start.1 as f32 * 8.0, 0.0),
+                Pos2::new((last_col + 1) as f32 * 8.0, 16.0),
+            );
+            // Check both the movement frame and an idle frame with the button
+            // still held: no release or later pointer event should be needed.
+            for idle in [false, true] {
+                let mut events = passes.clone();
+                if idle {
+                    events.push(vec![]);
+                }
+                let drawn = frames(None, events);
+                assert!(drawn.dragging);
+                assert_eq!(drawn.selection, Some(selected));
+                assert!(drawn.out.copy.is_none(), "dragging must not copy yet");
+                assert!(
+                    drawn.boxes.contains(&expected),
+                    "missing selection {expected:?}: {:?}",
+                    drawn.boxes
+                );
+            }
+            let mut events = passes;
+            events.push(vec![egui::Event::PointerButton {
+                pos: position(end),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+            let drawn = frames(None, events);
+            assert!(!drawn.dragging);
+            assert_eq!(drawn.selection, Some(selected));
+        }
     }
 
     /// The notice a session that went away is announced with.
