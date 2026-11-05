@@ -22,14 +22,14 @@ GUI 与 CLI 共用 `src/ssh`、`src/terminal` 和配置代码。连接、认证�
 
 ## 下载
 
-最新版本：[v0.2.1](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.2.1)
+最新版本：[0.2.1](https://github.com/0alexwu0/ImGoSSH/releases/tag/0.2.1)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/0.2.1/ImGoSSH-0.2.1-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/0.2.1/ImGoSSH-0.2.1-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/0.2.1/ImGoSSH-0.2.1-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/0.2.1/ImGoSSH-0.2.1-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
 每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE` 和 `README.md`。Release 页面同时提供 SHA-256 校验值。
 
