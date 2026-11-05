@@ -104,7 +104,11 @@ impl SessionEditor {
                             .on_hover_text(t!("Write the session to the log"))
                             .clicked()
                         {
-                            log::info!("session: {:?}", self.session);
+                            log::info!(
+                                "session: {} ({})",
+                                self.session.title(),
+                                self.session.target()
+                            );
                         }
                     });
                 });
@@ -567,7 +571,13 @@ pub struct ChallengeBuffer {
 
 /// The settings window. Returns whether anything changed; `open` is cleared
 /// when the user closes it.
-pub fn settings_dialog(ui: &mut Ui, config: &mut Config, open: &mut bool) -> bool {
+pub fn settings_dialog(
+    ui: &mut Ui,
+    config: &mut Config,
+    open: &mut bool,
+    encrypted: bool,
+    security: &mut bool,
+) -> bool {
     *open = true;
     let mut changed = false;
     let (_, warn, _, muted) = theme::tones(ui);
@@ -739,7 +749,16 @@ pub fn settings_dialog(ui: &mut Ui, config: &mut Config, open: &mut bool) -> boo
                             t!("Save passwords in sessions.toml"),
                         )
                         .changed();
-                    if config.store_passwords {
+                    theme::section(ui, t!("Session file encryption"));
+                    ui.label(if encrypted {
+                        t!("Session file is encrypted")
+                    } else {
+                        t!("Session file is not encrypted")
+                    });
+                    if ui.button(t!("Manage encryption and password")).clicked() {
+                        *security = true;
+                    }
+                    if config.store_passwords && !encrypted {
                         ui.label(
                             RichText::new(t!(
                                 "Passwords are stored in clear text in sessions.toml."

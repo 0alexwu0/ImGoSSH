@@ -23,6 +23,7 @@ pub mod terminal;
 pub mod ui;
 pub mod update;
 pub mod util;
+mod vault;
 
 /// Things every binary and UI module needs.
 pub mod prelude {

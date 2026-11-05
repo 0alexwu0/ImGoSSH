@@ -14,6 +14,7 @@ pub mod browser;
 pub mod chrome;
 pub mod dialogs;
 pub mod properties;
+mod security;
 pub mod sidebar;
 pub mod terminal;
 pub mod theme;

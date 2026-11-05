@@ -22,14 +22,14 @@ GUI 与 CLI 共用 `src/ssh`、`src/terminal` 和配置代码。连接、认证�
 
 ## 下载
 
-最新版本：[v0.1.6](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.1.6)
+最新版本：[v0.2.1](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.2.1)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.1.6/ImGoSSH-0.1.6-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.1.6/ImGoSSH-0.1.6-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.1.6/ImGoSSH-0.1.6-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.1.6/ImGoSSH-0.1.6-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
 每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE` 和 `README.md`。Release 页面同时提供 SHA-256 校验值。
 
@@ -200,12 +200,18 @@ Release 构建会在 `target/release/` 生成四个程序。Windows 构建会尝
 | 文件 | 内容 |
 | --- | --- |
 | `config.toml` | 主题、字体、回滚、默认会话、窗口状态和更新设置 |
-| `sessions.toml` | 会话、文件夹、启动脚本和隧道 |
+| `sessions.toml` | 会话、文件夹、启动脚本和隧道；启用加密后为加密二进制文件 |
 | `known_hosts` | ImGoSSH 使用的主机密钥库 |
 
 设置 `IMGOSSH_HOME` 可以把整个数据目录移动到其他位置，例如 U 盘。调试时设置 `RUST_LOG=debug`。
 
-会话文件示例：
+会话文件加密可在“设置 → 管理加密与密码”中启用、关闭或修改密码。首次使用时，在首次新建会话并确认保存后询问是否设置密码；已有 `sessions.toml` 的用户升级后，启动时询问一次。选择设置后立即加密当前会话文件；选择暂不加密后，可随时从设置中启用。
+
+启用后，启动时需要密码才能读取会话。选择“暂不解锁”后仍可使用软件，但新增会话仅保留在内存中，不会写入 `sessions.toml`，也不会再次提示设置密码；之后解锁会恢复文件中的原会话列表，临时会话不会自动合并保存，已打开的连接仍可继续使用。
+
+“保存密码”使用 Windows 凭据管理器、macOS 钥匙串或 Linux Secret Service，密码不写入 `config.toml`，凭据标识采用混淆及数据目录哈希处理。系统凭据库不可用时会提示错误，可继续手动输入密码。取消保存会删除系统凭据，后续启动恢复手动解锁。移动 `IMGOSSH_HOME` 后需重新保存自动解锁凭据。
+
+加密使用 PBKDF2-HMAC-SHA256（600,000 次迭代、随机盐）派生密钥及 AES-256-GCM，每次保存生成新的随机 nonce 并校验文件完整性。密码无法找回，请单独妥善保管；启用自动解锁意味着当前操作系统账户可以读取密码。下列示例仅适用于未加密文件：
 
 ```toml
 [[session]]
@@ -272,7 +278,7 @@ cargo test --test live_server -- --ignored --nocapture --test-threads=1
 
 ## 安全与限制
 
-- `sessions.toml` 可能明文保存密码。共享机器上建议使用私钥、ssh-agent 或 Pageant，并关闭密码保存。
+- 未启用会话文件加密时，`sessions.toml` 可能明文保存连接密码。可在设置中启用加密；共享机器上建议使用私钥、ssh-agent 或 Pageant，并关闭密码保存。
 - 首次连接会校验主机密钥；指纹变化时会阻断连接并要求确认。
 - 主机密钥会从应用数据目录和 `~/.ssh/known_hosts` 读取，新接受的密钥写入应用数据目录；目前不匹配 OpenSSH 的哈希主机名条目。
 - 文件传输使用 SFTP 子系统，服务器需要启用 SFTP 服务。

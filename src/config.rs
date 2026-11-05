@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
+
+use crate::vault;
 
 pub const APP_NAME: &str = "ImGoSSH";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -463,6 +466,8 @@ pub struct Config {
     pub sftp_width: f32,
     pub confirm_close: bool,
     pub store_passwords: bool,
+    /// Whether the user has answered the optional session encryption prompt.
+    pub session_encryption_prompted: bool,
     pub window_width: f32,
     pub window_height: f32,
     /// Ask GitHub for a newer release on startup and every few hours after.
@@ -510,6 +515,7 @@ impl Default for Config {
             sftp_width: default_sftp_width(),
             confirm_close: true,
             store_passwords: true,
+            session_encryption_prompted: false,
             window_width: 1200.0,
             window_height: 760.0,
             check_updates: true,
@@ -520,6 +526,11 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Read window preferences without opening or unlocking the session file.
+    pub fn load() -> Self {
+        read_toml(&store_dir().join("config.toml")).unwrap_or_default()
+    }
+
     pub fn palette(&self) -> Palette {
         Palette::preset(&self.palette)
     }
@@ -548,6 +559,17 @@ pub struct Store {
     pub sessions: Vec<Session>,
     config_path: PathBuf,
     sessions_path: PathBuf,
+    access: SessionsAccess,
+    remembered: bool,
+    pub session_error: Option<String>,
+    legacy_sessions: bool,
+}
+
+enum SessionsAccess {
+    Plain,
+    Locked,
+    Unavailable,
+    Encrypted(vault::Key),
 }
 
 impl Default for Store {
@@ -559,7 +581,10 @@ impl Default for Store {
 impl Store {
     /// Load from disk, falling back to sane defaults on any error.
     pub fn load() -> Self {
-        let dir = store_dir();
+        Self::load_from(&store_dir(), true)
+    }
+
+    pub(crate) fn load_from(dir: &Path, recall: bool) -> Self {
         let config_path = dir.join("config.toml");
         let sessions_path = dir.join("sessions.toml");
 
@@ -570,27 +595,165 @@ impl Store {
             Config::default()
         });
 
-        let sessions = read_toml::<SessionsFile>(&sessions_path)
-            .map(|f| f.session)
-            .unwrap_or_default();
-
-        Self {
+        let mut store = Self {
             config,
-            sessions,
+            sessions: Vec::new(),
             config_path,
             sessions_path,
+            access: SessionsAccess::Plain,
+            remembered: false,
+            session_error: None,
+            legacy_sessions: false,
+        };
+        match std::fs::read(&store.sessions_path) {
+            Ok(data) if vault::is_encrypted(&data) => {
+                store.access = SessionsAccess::Locked;
+                if recall {
+                    if let Ok(password) = vault::recalled(&store.sessions_path) {
+                        store.remembered = true;
+                        let _ = store.unlock(&password);
+                    }
+                }
+            }
+            Ok(data) => match Self::parse_sessions(&data) {
+                Ok(sessions) => {
+                    store.sessions = sessions;
+                    store.legacy_sessions = true;
+                }
+                Err(_) => {
+                    store.access = SessionsAccess::Unavailable;
+                    store.session_error =
+                        Some("Cannot read sessions.toml; the file will not be overwritten".into());
+                }
+            },
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                store.access = SessionsAccess::Unavailable;
+                store.session_error =
+                    Some("Cannot read sessions.toml; the file will not be overwritten".into());
+            }
         }
+        store
     }
 
     pub fn save(&self) -> Result<()> {
-        ensure_store_dir()?;
         write_toml(&self.config_path, &self.config)?;
-        write_toml(
-            &self.sessions_path,
-            &SessionsFile {
-                session: self.sessions.clone(),
-            },
+        match &self.access {
+            // Never turn a locked, corrupt, or unreadable vault into an empty database.
+            SessionsAccess::Locked | SessionsAccess::Unavailable => Ok(()),
+            SessionsAccess::Plain
+                if self.needs_encryption_prompt()
+                    || (self.sessions.is_empty() && !self.sessions_path.exists()) =>
+            {
+                Ok(())
+            }
+            SessionsAccess::Plain => {
+                atomic_write(&self.sessions_path, self.session_text()?.as_bytes())
+            }
+            SessionsAccess::Encrypted(key) => atomic_write(
+                &self.sessions_path,
+                &key.seal(self.session_text()?.as_bytes())?,
+            ),
+        }
+    }
+
+    fn parse_sessions(bytes: &[u8]) -> Result<Vec<Session>> {
+        let text = std::str::from_utf8(bytes).context("Invalid session encoding")?;
+        // TOML diagnostics may quote secrets: never return the original parse error.
+        toml::from_str::<SessionsFile>(text)
+            .map(|f| f.session)
+            .map_err(|_| anyhow::anyhow!("Invalid session data"))
+    }
+
+    fn session_text(&self) -> Result<Zeroizing<String>> {
+        Ok(Zeroizing::new(toml::to_string_pretty(&SessionsFile {
+            session: self.sessions.clone(),
+        })?))
+    }
+
+    pub fn sessions_locked(&self) -> bool {
+        matches!(self.access, SessionsAccess::Locked)
+    }
+    pub fn sessions_writable(&self) -> bool {
+        matches!(
+            self.access,
+            SessionsAccess::Plain | SessionsAccess::Encrypted(_)
         )
+    }
+    pub fn sessions_encrypted(&self) -> bool {
+        matches!(
+            self.access,
+            SessionsAccess::Locked | SessionsAccess::Encrypted(_)
+        )
+    }
+    pub fn password_remembered(&self) -> bool {
+        self.remembered
+    }
+
+    pub fn needs_encryption_prompt(&self) -> bool {
+        matches!(self.access, SessionsAccess::Plain)
+            && !self.config.session_encryption_prompted
+            && (self.legacy_sessions || !self.sessions.is_empty())
+    }
+
+    pub fn decline_encryption(&mut self) -> Result<()> {
+        self.config.session_encryption_prompted = true;
+        self.save()
+    }
+
+    pub fn unlock(&mut self, password: &str) -> Result<()> {
+        anyhow::ensure!(self.sessions_locked(), "Sessions are not locked");
+        let data = std::fs::read(&self.sessions_path).context("Reading encrypted sessions")?;
+        let (key, text) = vault::Key::open(&data, password)?;
+        let mut saved = Self::parse_sessions(&text)?;
+        // Sessions made while locked are temporary and must not become persisted on unlock.
+        self.sessions.clear();
+        self.sessions.append(&mut saved);
+        self.access = SessionsAccess::Encrypted(key);
+        Ok(())
+    }
+
+    pub fn remember_password(&mut self, password: &str) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.access, SessionsAccess::Encrypted(_)),
+            "Unlock sessions first"
+        );
+        let data = std::fs::read(&self.sessions_path)?;
+        vault::Key::open(&data, password)?;
+        vault::remember(&self.sessions_path, password)?;
+        self.remembered = true;
+        Ok(())
+    }
+
+    pub fn forget_password(&mut self) -> Result<()> {
+        if !self.remembered {
+            return Ok(());
+        }
+        vault::forget(&self.sessions_path)?;
+        self.remembered = false;
+        Ok(())
+    }
+
+    /// Re-encrypt only after the current password has authenticated the on-disk file.
+    pub fn set_encryption(&mut self, current: &str, password: Option<&str>) -> Result<()> {
+        anyhow::ensure!(self.sessions_writable(), "Unlock sessions first");
+        if self.sessions_encrypted() {
+            vault::Key::open(&std::fs::read(&self.sessions_path)?, current)?;
+        }
+        let key = password.map(vault::Key::new).transpose()?;
+        let text = self.session_text()?;
+        let data = Zeroizing::new(match &key {
+            Some(key) => key.seal(text.as_bytes())?,
+            None => text.as_bytes().to_vec(),
+        });
+        // Remove any stale auto-unlock credential before changing the file's password.
+        self.forget_password()?;
+        atomic_write(&self.sessions_path, &data)?;
+        self.access = key
+            .map(SessionsAccess::Encrypted)
+            .unwrap_or(SessionsAccess::Plain);
+        self.config.session_encryption_prompted = true;
+        write_toml(&self.config_path, &self.config)
     }
 
     /// Index of a session by its position in [`Store::sessions`].
@@ -672,13 +835,170 @@ fn read_toml<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 fn write_toml<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
     let text = toml::to_string_pretty(value).context("serialising settings")?;
-    // Write atomically so a crash cannot truncate the session database.
-    let tmp = path.with_extension("toml.tmp");
-    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    atomic_write(path, text.as_bytes())
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // A unique temporary file is removed on failure; encrypted writes never stage plaintext.
+    let mut tmp = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)
+        .map_err(|e| e.error)
+        .with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod vault_tests {
+    use super::*;
+
+    fn seed(store: &mut Store) {
+        let mut session = Session::new(Protocol::Ssh);
+        session.name = "production-secret".into();
+        session.password = "connection-secret".into();
+        store.sessions.push(session);
+    }
+
+    #[test]
+    fn first_run_defers_offer_and_plaintext_until_first_session_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load_from(dir.path(), false);
+        assert!(!store.needs_encryption_prompt());
+        store.save().unwrap();
+        assert!(!store.sessions_path.exists());
+        seed(&mut store);
+        assert!(store.needs_encryption_prompt());
+        store.save().unwrap();
+        assert!(!store.sessions_path.exists());
+        store.decline_encryption().unwrap();
+        let reopened = Store::load_from(dir.path(), false);
+        assert!(!reopened.needs_encryption_prompt());
+        assert_eq!(reopened.sessions, store.sessions);
+    }
+
+    #[test]
+    fn migration_locked_writes_and_password_rotation_preserve_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load_from(dir.path(), false);
+        seed(&mut store);
+        write_toml(
+            &store.sessions_path,
+            &SessionsFile {
+                session: store.sessions.clone(),
+            },
+        )
+        .unwrap();
+        let original = std::fs::read(&store.sessions_path).unwrap();
+        let mut store = Store::load_from(dir.path(), false);
+        assert!(store.needs_encryption_prompt());
+        store.save().unwrap();
+        assert_eq!(std::fs::read(&store.sessions_path).unwrap(), original);
+        store.set_encryption("", Some("master-one")).unwrap();
+        let sealed = std::fs::read(&store.sessions_path).unwrap();
+        assert!(vault::is_encrypted(&sealed));
+        assert!(!sealed.windows(17).any(|w| w == b"connection-secret"));
+        let mut locked = Store::load_from(dir.path(), false);
+        assert!(locked.sessions_locked());
+        assert!(!locked.needs_encryption_prompt());
+        assert!(locked.sessions.is_empty());
+        seed(&mut locked);
+        locked.config.font_size = 20.0;
+        locked.save().unwrap();
+        assert_eq!(std::fs::read(&locked.sessions_path).unwrap(), sealed);
+        assert!(locked.unlock("incorrect").is_err());
+        assert!(locked.sessions_locked());
+        assert!(locked.set_encryption("", None).is_err());
+        locked.unlock("master-one").unwrap();
+        assert_eq!(locked.sessions, store.sessions);
+        assert!(locked
+            .set_encryption("incorrect", Some("master-two"))
+            .is_err());
+        assert_eq!(std::fs::read(&locked.sessions_path).unwrap(), sealed);
+        locked
+            .set_encryption("master-one", Some("master-two"))
+            .unwrap();
+        let mut reopened = Store::load_from(dir.path(), false);
+        assert!(reopened.unlock("master-one").is_err());
+        reopened.unlock("master-two").unwrap();
+        reopened.sessions[0].host = "updated.example".into();
+        reopened.save().unwrap();
+        let mut reopened = Store::load_from(dir.path(), false);
+        reopened.unlock("master-two").unwrap();
+        assert_eq!(reopened.sessions[0].host, "updated.example");
+        reopened.set_encryption("master-two", None).unwrap();
+        let plain = Store::load_from(dir.path(), false);
+        assert!(!plain.sessions_encrypted());
+        assert!(!plain.needs_encryption_prompt());
+        assert_eq!(plain.sessions, reopened.sessions);
+        let config = std::fs::read_to_string(plain.config_path).unwrap();
+        for secret in ["master-one", "master-two", "connection-secret"] {
+            assert!(!config.contains(secret));
+        }
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn corrupt_or_unreadable_files_are_never_replaced() {
+        for bytes in [
+            b"password = secret\ninvalid TOML".as_slice(),
+            b"ImGoSSH-SESSION-VAULT\0truncated",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("sessions.toml");
+            std::fs::write(&path, bytes).unwrap();
+            let mut store = Store::load_from(dir.path(), false);
+            seed(&mut store);
+            store.save().unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), bytes);
+            assert!(!store.needs_encryption_prompt());
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sessions.toml")).unwrap();
+        let mut store = Store::load_from(dir.path(), false);
+        assert!(!store.sessions_writable());
+        seed(&mut store);
+        store.save().unwrap();
+        assert!(store.sessions_path.is_dir());
+    }
+
+    #[test]
+    #[ignore = "requires an unlocked native system credential store"]
+    fn native_credential_auto_unlock_and_forget() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load_from(dir.path(), false);
+        seed(&mut store);
+        store
+            .set_encryption("", Some("test-vault-password"))
+            .unwrap();
+        // Always clean up even if an assertion panics.
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = vault::forget(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(store.sessions_path.clone());
+        store.remember_password("test-vault-password").unwrap();
+        let mut reopened = Store::load_from(dir.path(), true);
+        assert!(!reopened.sessions_locked());
+        assert!(reopened.password_remembered());
+        assert_eq!(reopened.sessions, store.sessions);
+        reopened
+            .set_encryption("test-vault-password", Some("rotated-vault-password"))
+            .unwrap();
+        assert!(vault::recalled(&reopened.sessions_path).is_err());
+        reopened
+            .remember_password("rotated-vault-password")
+            .unwrap();
+        assert!(!Store::load_from(dir.path(), true).sessions_locked());
+        reopened.forget_password().unwrap();
+        assert!(Store::load_from(dir.path(), true).sessions_locked());
+        assert!(vault::recalled(&reopened.sessions_path).is_err());
+    }
 }

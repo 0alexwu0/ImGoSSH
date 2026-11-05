@@ -54,12 +54,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      - name: Linux credential store dependencies
+        if: matrix.label == 'linux-x86_64'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Test
         if: matrix.test != false
-        run: cargo test --workspace --target ${{ matrix.target }}
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
 
       - name: Package (Windows)
         if: startsWith(matrix.label, 'windows')
@@ -108,3 +112,37 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
+
+  publish:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          for file in dist/ImGoSSH-*; do
+            name="$(basename "$file")"
+            mv "$file" "dist/ImGoSSH-${version}-${name#ImGoSSH-}"
+          done
+          (cd dist && sha256sum ImGoSSH-* > SHA256SUMS.txt)
+          notes="docs/release-${RELEASE_TAG}.md"
+          if [ -f "$notes" ]; then
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "ImGoSSH ${RELEASE_TAG}" --notes-file "$notes" --draft
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --title "ImGoSSH ${RELEASE_TAG}" --generate-notes --draft
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest

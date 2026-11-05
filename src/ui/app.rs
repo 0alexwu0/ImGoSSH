@@ -148,6 +148,9 @@ pub struct App {
     confirm_close: Option<usize>,
     name_prompt: Option<NamePrompt>,
     show_settings: bool,
+    security: Option<super::security::SecurityDialog>,
+    deferred_startup: Option<Startup>,
+    storage_error: Option<String>,
     show_transfers: bool,
     show_about: bool,
     /// The online updater: what GitHub last said, and how a download is going.
@@ -211,6 +214,13 @@ impl App {
                 .expect("tokio runtime"),
         );
         let (prompter, prompts) = Prompter::channel();
+        let security = super::security::SecurityDialog::initial(&store);
+        let deferred_startup =
+            (store.sessions_locked() && startup.session.is_some()).then(|| startup.clone());
+        let storage_error = store
+            .session_error
+            .as_ref()
+            .map(|_| t!("Cannot read sessions.toml; the file will not be overwritten").to_string());
         let mut app = Self {
             store,
             palette,
@@ -228,6 +238,9 @@ impl App {
             confirm_close: None,
             name_prompt: None,
             show_settings: false,
+            security,
+            deferred_startup,
+            storage_error,
             show_transfers: false,
             show_about: false,
             updater: update::Updater::new(),
@@ -248,7 +261,9 @@ impl App {
             dirty: false,
         };
         app.apply_theme(&cc.egui_ctx);
-        app.startup(&startup);
+        if app.deferred_startup.is_none() {
+            app.startup(&startup);
+        }
         cc.egui_ctx.request_repaint();
         app
     }
@@ -1057,8 +1072,10 @@ impl eframe::App for App {
         self.record_window_size(&ctx);
         self.tick_blink(&ctx);
 
-        let shortcuts = self.take_shortcuts(&ctx);
-        self.run_shortcuts(shortcuts, &ctx);
+        if self.security.is_none() && self.storage_error.is_none() {
+            let shortcuts = self.take_shortcuts(&ctx);
+            self.run_shortcuts(shortcuts, &ctx);
+        }
 
         // Only the session on screen is worth polling; the others keep their
         // last sample until they come back into view.
@@ -1083,6 +1100,16 @@ impl eframe::App for App {
                 .min_size(160.0)
                 .default_size(width)
                 .show(ui, |ui| {
+                    if self.store.sessions_locked() {
+                        ui.label(t!(
+                            "Without unlocking, new sessions are temporary and will not be saved."
+                        ));
+                        if ui.button(t!("Unlock")).clicked() {
+                            self.security =
+                                Some(super::security::SecurityDialog::manage(&self.store));
+                        }
+                        ui.separator();
+                    }
                     // Sessions with a live tab light up in the tree.
                     let live: Vec<String> = self
                         .tabs
@@ -2628,8 +2655,20 @@ impl App {
 
                 if self.show_settings {
                     let mut settings_open = true;
-                    if dialogs::settings_dialog(ui, &mut self.store.config, &mut settings_open) {
+                    let mut security = false;
+                    let encrypted = self.store.sessions_encrypted();
+                    if dialogs::settings_dialog(
+                        ui,
+                        &mut self.store.config,
+                        &mut settings_open,
+                        encrypted,
+                        &mut security,
+                    ) {
                         self.dirty = true;
+                    }
+                    if security && (self.store.sessions_writable() || self.store.sessions_locked())
+                    {
+                        self.security = Some(super::security::SecurityDialog::manage(&self.store));
                     }
                     if !settings_open {
                         self.show_settings = false;
@@ -2674,9 +2713,47 @@ impl App {
             self.show_about = false;
         }
 
+        if self.security.is_none() && self.store.needs_encryption_prompt() {
+            self.security = super::security::SecurityDialog::initial(&self.store);
+        }
+        if let Some(dialog) = &mut self.security {
+            let was_locked = self.store.sessions_locked();
+            if dialog.show(ctx, &mut self.store) {
+                self.security = None;
+                if was_locked && !self.store.sessions_locked() {
+                    self.editor = None;
+                    self.editor_index = None;
+                }
+                if !self.store.sessions_locked() {
+                    if let Some(startup) = self.deferred_startup.take() {
+                        self.startup(&startup);
+                    }
+                }
+            }
+        }
+        if self.security.is_none() {
+            if let Some(error) = &self.storage_error {
+                let mut dismiss = false;
+                egui::Modal::new(egui::Id::new("storage-error")).show(ctx, |ui| {
+                    ui.set_width(420.0);
+                    ui.label(error);
+                    if ui.button(t!("OK")).clicked() {
+                        dismiss = true;
+                    }
+                });
+                if dismiss {
+                    self.storage_error = None;
+                }
+            }
+        }
+
         if self.dirty {
             if let Err(err) = self.store.save() {
                 log::warn!("saving settings: {err}");
+                self.storage_error = Some(format!(
+                    "{}: {err}",
+                    t!("Could not save settings or sessions")
+                ));
             }
             self.dirty = false;
         }
@@ -2688,6 +2765,12 @@ impl App {
         match editor.show(ui) {
             dialogs::EditorOutcome::Keep => {}
             dialogs::EditorOutcome::Save(session) => {
+                if !self.store.sessions_writable() {
+                    self.storage_error = Some(
+                        t!("Session is temporary because sessions.toml is locked or unreadable")
+                            .into(),
+                    );
+                }
                 match self.editor_index {
                     Some(index) => {
                         if let Some(existing) = self.store.sessions.get_mut(index) {

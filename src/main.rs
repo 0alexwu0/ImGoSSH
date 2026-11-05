@@ -7,7 +7,7 @@
 
 use clap::Parser;
 use eframe::NativeOptions;
-use imgossh::config::{Store, APP_NAME, APP_VERSION};
+use imgossh::config::{Config, APP_NAME, APP_VERSION};
 use imgossh::icon;
 use imgossh::ui::{App, Startup};
 
@@ -32,9 +32,9 @@ fn main() -> eframe::Result {
     env_logger::init();
     let cli = Cli::parse();
 
-    let store = Store::load();
+    let config = Config::load();
     let viewport = egui::ViewportBuilder::default()
-        .with_inner_size([store.config.window_width, store.config.window_height])
+        .with_inner_size([config.window_width, config.window_height])
         .with_min_inner_size([760.0, 420.0])
         .with_title(format!("{APP_NAME} {APP_VERSION}"))
         .with_icon(app_icon());
