@@ -157,6 +157,9 @@ impl Tunnel {
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 pub struct Session {
+    /// Runtime-only gateway mode; never persisted as a reusable connection.
+    #[serde(skip)]
+    pub jumpserver: bool,
     pub name: String,
     /// Slash separated tree path, e.g. `Clients/Production`.
     pub folder: String,
@@ -667,7 +670,12 @@ impl Store {
 
     fn session_text(&self) -> Result<Zeroizing<String>> {
         Ok(Zeroizing::new(toml::to_string_pretty(&SessionsFile {
-            session: self.sessions.clone(),
+            session: self
+                .sessions
+                .iter()
+                .filter(|s| !s.jumpserver)
+                .cloned()
+                .collect(),
         })?))
     }
 
@@ -857,6 +865,23 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod vault_tests {
     use super::*;
+
+    #[test]
+    fn temporary_gateway_credentials_cannot_be_written_to_the_session_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = Store::load_from(dir.path(), false);
+        seed(&mut store);
+        let mut gateway = Session::new(Protocol::Ssh);
+        gateway.jumpserver = true;
+        gateway.password = "temporary-gateway-secret".into();
+        store.sessions.push(gateway);
+        store.decline_encryption().unwrap();
+        let text = std::fs::read_to_string(&store.sessions_path).unwrap();
+        assert!(!text.contains("temporary-gateway-secret"));
+        let reopened = Store::load_from(dir.path(), false);
+        assert_eq!(reopened.sessions.len(), 1);
+        assert_eq!(reopened.sessions[0].name, "production-secret");
+    }
 
     fn seed(store: &mut Store) {
         let mut session = Session::new(Protocol::Ssh);

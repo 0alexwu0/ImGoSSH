@@ -22,22 +22,31 @@ GUI 与 CLI 共用 `src/ssh`、`src/terminal` 和配置代码。连接、认证�
 
 ## 下载
 
-最新版本：[v0.2.1](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.2.1)
+最新版本：[v0.2.2](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.2.2)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.1/ImGoSSH-0.2.1-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
-每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE` 和 `README.md`。Release 页面同时提供 SHA-256 校验值。
+每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md` 和 `integrations/jumpserver` 连接器及安装说明。Release 页面同时提供 SHA-256 校验值。
 
 Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发者签名和公证，首次运行时可能需要在「系统设置 → 隐私与安全性」中允许打开，或执行：
 
 ```bash
 xattr -dr com.apple.quarantine <解压目录>
 ```
+
+## v0.2.2 更新
+
+- 新增 JumpServer SSH / SFTP 接入，最低支持 Windows 上的 JumpServer Client 2.1.4，并适配 v4.1.9 索引插件。
+- 正常启动时自动检查两项连接配置，缺少时关闭对应桌面客户端，备份后补齐；已有完整配置时保持不变。此前仅有 SSH 的配置可自动升级。
+- 新增 GUI 的 `--sftp` 启动参数，直接打开文件浏览器。JumpServer 临时凭据仅用于当前连接，不写入已保存会话。
+- 修正 Windows 标题栏主题同步：增加旧版 Win10 接口回退、启动重试和切回窗口时刷新，处理偶发颜色不一致。
+
+详细说明见 [v0.2.2 发布说明](docs/release-0.2.2.md)。
 
 ## 开始使用
 
@@ -51,10 +60,24 @@ xattr -dr com.apple.quarantine <解压目录>
 ```bash
 imgossh --local
 imgossh user@example.com
+imgossh --sftp user@example.com
+imgossh user@example.com -p 2222 -i ~/.ssh/id_ed25519
 imgossh --session "Production"
 ```
 
 `--session` 按已保存会话的名称查找。Windows PowerShell 中，在解压目录运行程序时需要使用 `./imgossh.exe`；三个 CLI 工具也可以加入 `PATH` 后使用。
+
+### JumpServer 调用
+
+支持由已安装的 JumpServer 官方客户端启动 ImGoSSH，通过堡垒机网关连接 SSH 终端或使用 SFTP 传输文件。
+最低支持 JumpServer Client **v2.1.4（Windows）**：旧版通过 `config.json` 适配，
+新版保留 v4.1.9 的索引插件方式，安装器按配置格式选择。
+Windows 下正常打开 ImGoSSH 时会自动检查已安装客户端的 SSH 和 SFTP 配置；缺少连接配置时先关闭对应的
+JumpServer 桌面客户端，备份并写入配置。两项均已配置时不关闭、不重复写入。客户端 4 秒内未正常退出时会结束对应桌面进程；由 JumpServer 唤起的连接窗口跳过自动配置。
+配置位于受保护目录且无写权限时会提示失败原因，可用管理员身份重新打开。
+之后重新打开 JumpServer，以 SSH 客户端方式连接资产，或以 SFTP 客户端方式浏览目录、上传和下载文件。
+自定义路径、手动安装及恢复见 [JumpServer 集成说明](integrations/jumpserver/README.md)。临时连接仅保留在当前窗口内存中，
+不会自动加入已保存会话；SSH 模式默认关闭附带的 SFTP 面板；SFTP 模式直接打开文件浏览器。两种模式均关闭 SSH agent 和服务器监控。
 
 ## GUI 功能
 
@@ -261,7 +284,14 @@ ImGoSSH 不依赖本机 OpenSSH、Electron 或 WebView。SSH 协议、SFTP、终
 
 ```bash
 cargo fmt --all --check
-cargo test --workspace
+cargo test --workspace --locked
+```
+
+Windows 下还可运行连接器的隔离测试（使用临时配置，不会关闭已安装的客户端）：
+
+```powershell
+powershell -NoProfile -File integrations/jumpserver/Test-Install.ps1
+powershell -NoProfile -File integrations/jumpserver/Test-AutoConfigure.ps1
 ```
 
 [Release 工作流](.github/workflows/release.yml) 配置了 Windows、Linux 和两种 macOS 架构的构建与打包，并为原生目标配置工作区测试；macOS Intel 使用交叉编译，不运行测试。
@@ -282,6 +312,9 @@ cargo test --test live_server -- --ignored --nocapture --test-threads=1
 - 首次连接会校验主机密钥；指纹变化时会阻断连接并要求确认。
 - 主机密钥会从应用数据目录和 `~/.ssh/known_hosts` 读取，新接受的密钥写入应用数据目录；目前不匹配 OpenSSH 的哈希主机名条目。
 - 文件传输使用 SFTP 子系统，服务器需要启用 SFTP 服务。
+- JumpServer 接入目前仅提供 Windows 配置适配。SSH/SFTP 已通过本地网关协议测试，真实资产权限、传输和审计仍需在实际部署中验证。
+- JumpServer Client 2.1.4 的接口通过进程参数传递临时令牌，本机有相应权限的进程可能读取；旧版配置会借用 XShell / WinSCP 图标槽位，卸载可恢复。
+- Win10 标题栏修复已通过回归测试，当前开发机为 Win11，仍需在发生问题的 Win10 环境确认。
 - 当前不包含 X11、RDP、VNC、FTP、Telnet 或串口功能。
 - 文件浏览器不会自动跟随终端中的 `cd`。
 - Linux 和 macOS 已通过自动化构建与测试，但不同桌面环境的字体、剪贴板和文件对话框仍可能存在差异。

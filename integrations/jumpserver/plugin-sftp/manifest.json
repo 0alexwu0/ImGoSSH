@@ -1,0 +1,16 @@
+{
+  "id": "io.github.imgossh.sftp",
+  "name": "imgossh_sftp",
+  "display_name": "ImGoSSH SFTP",
+  "version": "1.0.0",
+  "min_client_version": "4.1.9",
+  "author": "Alex.Wu",
+  "homepage": "https://github.com/0alexwu0/ImGoSSH",
+  "category": "filetransfer",
+  "protocols": ["sftp"],
+  "builtin": false,
+  "comment": {
+    "zh": "使用 ImGoSSH 通过 JumpServer 网关传输文件。",
+    "en": "Transfer files through the JumpServer gateway using ImGoSSH."
+  }
+}

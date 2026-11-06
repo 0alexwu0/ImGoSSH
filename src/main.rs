@@ -9,28 +9,12 @@ use clap::Parser;
 use eframe::NativeOptions;
 use imgossh::config::{Config, APP_NAME, APP_VERSION};
 use imgossh::icon;
-use imgossh::ui::{App, Startup};
-
-#[derive(Parser)]
-#[command(
-    name = "imgossh",
-    version = APP_VERSION,
-    about = "SSH / SFTP / SCP workstation written in Rust"
-)]
-struct Cli {
-    /// Open a local pseudo-console tab on startup
-    #[arg(long)]
-    local: bool,
-    /// Open a saved session by name on startup
-    #[arg(short, long)]
-    session: Option<String>,
-    /// Connect to [user@]host on startup
-    host: Option<String>,
-}
+use imgossh::startup::Args;
+use imgossh::ui::App;
 
 fn main() -> eframe::Result {
     env_logger::init();
-    let cli = Cli::parse();
+    let cli = Args::parse();
 
     let config = Config::load();
     let viewport = egui::ViewportBuilder::default()
@@ -39,11 +23,7 @@ fn main() -> eframe::Result {
         .with_title(format!("{APP_NAME} {APP_VERSION}"))
         .with_icon(app_icon());
 
-    let startup = Startup {
-        local: cli.local,
-        session: cli.session,
-        host: cli.host,
-    };
+    let startup = cli.into_startup(&config);
 
     eframe::run_native(
         APP_NAME,

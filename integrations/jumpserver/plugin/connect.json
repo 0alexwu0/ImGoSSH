@@ -1,0 +1,17 @@
+{
+  "platform": "windows",
+  "display_name": "ImGoSSH",
+  "match_first": [],
+  "is_default": false,
+  "is_set": false,
+  "is_internal": false,
+  "executable": {
+    "type": "user_path",
+    "default": "",
+    "required": true
+  },
+  "launch": {
+    "type": "args",
+    "template": "--jumpserver --host={host} --port={port} --username={username} --password={value}"
+  }
+}

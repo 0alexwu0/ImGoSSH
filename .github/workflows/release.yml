@@ -71,6 +71,13 @@ jobs:
         if: matrix.test != false
         run: cargo test --workspace --locked --target ${{ matrix.target }}
 
+      - name: Test JumpServer connector installer
+        if: startsWith(matrix.label, 'windows')
+        shell: powershell
+        run: |
+          .\integrations\jumpserver\Test-Install.ps1
+          .\integrations\jumpserver\Test-AutoConfigure.ps1
+
       - name: Package (Windows)
         if: startsWith(matrix.label, 'windows')
         shell: pwsh
@@ -80,13 +87,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           foreach ($n in 'imgossh','igssh','igscp','igsftp') { Copy-Item "$t/$n.exe" $out }
           Copy-Item LICENSE, README.md $out
+          Copy-Item integrations $out -Recurse
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = "${{ runner.temp }}/${{ matrix.artifact }}.zip"
-          $a = [IO.Compression.ZipFile]::Open($zip, 'Create')
-          foreach ($f in Get-ChildItem $out) {
-            [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($a, $f.FullName, $f.Name) | Out-Null
-          }
-          $a.Dispose()
+          [IO.Compression.ZipFile]::CreateFromDirectory($out, $zip)
           "ASSET=$zip" >> $env:GITHUB_ENV
 
       - name: Package (Linux)
@@ -98,6 +102,7 @@ jobs:
           mkdir -p "$d"
           for n in imgossh igssh igscp igsftp; do cp "target/${{ matrix.target }}/release/$n" "$d/"; done
           cp LICENSE README.md "$d/"
+          cp -R integrations "$d/"
           tar -C "$(dirname "$d")" -czf "${{ runner.temp }}/${{ matrix.artifact }}.tar.gz" "$(basename "$d")"
           echo "ASSET=${{ runner.temp }}/${{ matrix.artifact }}.tar.gz" >> "$GITHUB_ENV"
 
@@ -110,6 +115,7 @@ jobs:
           mkdir -p "$d"
           for n in imgossh igssh igscp igsftp; do cp "target/${{ matrix.target }}/release/$n" "$d/"; done
           cp LICENSE README.md "$d/"
+          cp -R integrations "$d/"
           ditto -c -k --sequesterRsrc "$d" "${{ runner.temp }}/${{ matrix.artifact }}.zip"
           echo "ASSET=${{ runner.temp }}/${{ matrix.artifact }}.zip" >> "$GITHUB_ENV"
 

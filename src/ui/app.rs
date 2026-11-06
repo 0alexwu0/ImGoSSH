@@ -18,6 +18,7 @@ use crate::ssh::client::{
 use crate::ssh::monitor::{Monitor, ServerInfo, DEFAULT_INTERVAL};
 use crate::ssh::transfer::Queue;
 use crate::ssh::{local::LocalPty, Backend};
+pub use crate::startup::Startup;
 use crate::t;
 use crate::terminal::Emulator;
 use crate::ui::browser::Browser;
@@ -119,17 +120,6 @@ struct NamePrompt {
     kind: NameKind,
 }
 
-/// What to open automatically when the window appears.
-#[derive(Debug, Default, Clone)]
-pub struct Startup {
-    /// Open a local pseudo-console tab.
-    pub local: bool,
-    /// Open a saved session by name.
-    pub session: Option<String>,
-    /// Connect to `[user@]host` in a new tab.
-    pub host: Option<String>,
-}
-
 /// The application.
 pub struct App {
     store: Store,
@@ -151,6 +141,8 @@ pub struct App {
     security: Option<super::security::SecurityDialog>,
     deferred_startup: Option<Startup>,
     storage_error: Option<String>,
+    jumpserver_report: Option<std::sync::mpsc::Receiver<anyhow::Result<crate::jumpserver::Report>>>,
+    jumpserver_notice: Option<String>,
     show_transfers: bool,
     show_about: bool,
     /// The online updater: what GitHub last said, and how a download is going.
@@ -221,6 +213,18 @@ impl App {
             .session_error
             .as_ref()
             .map(|_| t!("Cannot read sessions.toml; the file will not be overwritten").to_string());
+        // A connection launched by JumpServer must never close its own caller.
+        let jumpserver_report = if startup.connection.as_ref().is_some_and(|s| s.jumpserver) {
+            None
+        } else {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let ctx = cc.egui_ctx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(crate::jumpserver::configure());
+                ctx.request_repaint();
+            });
+            Some(rx)
+        };
         let mut app = Self {
             store,
             palette,
@@ -241,6 +245,8 @@ impl App {
             security,
             deferred_startup,
             storage_error,
+            jumpserver_report,
+            jumpserver_notice: None,
             show_transfers: false,
             show_about: false,
             updater: update::Updater::new(),
@@ -269,6 +275,10 @@ impl App {
     }
 
     fn startup(&mut self, startup: &Startup) {
+        if let Some(session) = &startup.connection {
+            self.launch(session.clone());
+            return;
+        }
         if let Some(name) = &startup.session {
             if let Some(index) = self.store.sessions.iter().position(|s| &s.name == name) {
                 let session = self.store.sessions[index].clone();
@@ -449,9 +459,11 @@ impl App {
             *conn_slot.lock().unwrap() = Some(conn.clone());
             *status.lock().unwrap() = Status::Running;
             let repaint = ctx.clone();
-            monitor.attach(conn.clone(), DEFAULT_INTERVAL, move || {
-                repaint.request_repaint();
-            });
+            if !session.jumpserver {
+                monitor.attach(conn.clone(), DEFAULT_INTERVAL, move || {
+                    repaint.request_repaint();
+                });
+            }
             ctx.request_repaint();
 
             if !want_shell {
@@ -1031,11 +1043,14 @@ impl eframe::App for App {
         // ends up wearing a white caption. The panels sit on `surface` and the
         // title reads in `text`, so the frame is those two colours and no other.
         let tokens = theme::tokens(self.store.config.theme, &self.palette);
-        self.chrome.follow(chrome::Want {
-            caption: tokens.surface,
-            text: tokens.text,
-            dark: tokens.dark,
-        });
+        self.chrome.follow(
+            ctx,
+            chrome::Want {
+                caption: tokens.surface,
+                text: tokens.text,
+                dark: tokens.dark,
+            },
+        );
         self.poll_prompts();
         self.poll_updater(ctx);
         if self.poll_connections() {
@@ -1082,7 +1097,8 @@ impl eframe::App for App {
         for (index, tab) in self.tabs.iter().enumerate() {
             let idle = index != self.active
                 || !self.store.config.show_statusbar
-                || !self.store.config.show_server_monitor;
+                || !self.store.config.show_server_monitor
+                || tab.session.jumpserver;
             tab.monitor.set_paused(idle);
         }
 
@@ -1825,7 +1841,9 @@ impl App {
                 tunnels,
                 target: tab.session.target(),
                 remote: tab.session.protocol.is_remote(),
-                monitor: self.store.config.show_server_monitor && tab.session.protocol.is_remote(),
+                monitor: self.store.config.show_server_monitor
+                    && tab.session.protocol.is_remote()
+                    && !tab.session.jumpserver,
                 info: tab.monitor.snapshot(),
             }
         });
@@ -2728,6 +2746,38 @@ impl App {
                     if let Some(startup) = self.deferred_startup.take() {
                         self.startup(&startup);
                     }
+                }
+            }
+        }
+        if let Some(receiver) = &self.jumpserver_report {
+            if let Ok(result) = receiver.try_recv() {
+                self.jumpserver_report = None;
+                self.jumpserver_notice = match result {
+                    Ok(report) if report.status == "installed" => Some(t!(
+                        "JumpServer connection configured. Restart JumpServer Client to use ImGoSSH. Configuration: {0}", report.path
+                    )),
+                    Ok(report) if report.status == "error" => Some(t!(
+                        "Could not configure JumpServer: {0}", report.detail
+                    )),
+                    Err(error) => Some(t!("Could not configure JumpServer: {0}", error)),
+                    Ok(report) if matches!(report.status.as_str(), "present" | "not_found") => None,
+                    Ok(_) => Some(t!("Could not configure JumpServer: {0}", "Unexpected integration result")),
+                };
+            }
+        }
+        if self.security.is_none() && self.storage_error.is_none() {
+            if let Some(notice) = &self.jumpserver_notice {
+                let mut dismiss = false;
+                egui::Modal::new(egui::Id::new("jumpserver-notice")).show(ctx, |ui| {
+                    ui.set_width(460.0);
+                    ui.heading(t!("JumpServer integration"));
+                    ui.label(notice);
+                    if ui.button(t!("OK")).clicked() {
+                        dismiss = true;
+                    }
+                });
+                if dismiss {
+                    self.jumpserver_notice = None;
                 }
             }
         }

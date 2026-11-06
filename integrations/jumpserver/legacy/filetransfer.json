@@ -1,0 +1,18 @@
+{
+  "name": "winscp",
+  "display_name": "ImGoSSH SFTP",
+  "protocol": ["sftp"],
+  "comment": {
+    "zh": "ImGoSSH SFTP 文件传输（借用旧客户端的 WinSCP 图标槽位）。",
+    "en": "ImGoSSH SFTP file transfer (uses the legacy client's WinSCP icon slot)."
+  },
+  "download_url": "https://github.com/0alexwu0/ImGoSSH",
+  "type": "linux",
+  "path": "",
+  "arg_format": "--jumpserver --sftp --host={host} --port={port} --username={username} --password={value}",
+  "match_first": ["sftp"],
+  "is_internal": false,
+  "is_default": true,
+  "is_set": true,
+  "_imgossh_connector": 1
+}

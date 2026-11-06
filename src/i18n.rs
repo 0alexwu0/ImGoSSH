@@ -266,6 +266,9 @@ fn zh(key: &'static str) -> &'static str {
         "Show transfer queue" => "显示传输队列",
         "Clear finished" => "清除已完成",
         "About ImGoSSH" => "关于 ImGoSSH",
+        "JumpServer integration" => "JumpServer 集成",
+        "JumpServer connection configured. Restart JumpServer Client to use ImGoSSH. Configuration: {0}" => "已配置 JumpServer 连接。重新启动 JumpServer 客户端即可使用 ImGoSSH。配置文件：{0}",
+        "Could not configure JumpServer: {0}" => "无法配置 JumpServer：{0}",
         "Open settings folder" => "打开设置目录",
         "Session log" => "会话日志",
 

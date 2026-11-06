@@ -1,0 +1,16 @@
+{
+  "id": "io.github.imgossh",
+  "name": "imgossh",
+  "display_name": "ImGoSSH",
+  "version": "1.0.0",
+  "min_client_version": "4.1.9",
+  "author": "Alex.Wu",
+  "homepage": "https://github.com/0alexwu0/ImGoSSH",
+  "category": "terminal",
+  "protocols": ["ssh"],
+  "builtin": false,
+  "comment": {
+    "zh": "使用 ImGoSSH 通过 JumpServer SSH 网关连接资产。",
+    "en": "Connect to assets through the JumpServer SSH gateway using ImGoSSH."
+  }
+}

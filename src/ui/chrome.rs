@@ -19,48 +19,88 @@ pub struct Want {
     pub dark: bool,
 }
 
-/// The frame colours the operating system was last given.
+/// Native theme changes can finish after the first egui frame. Reapply for a
+/// bounded startup interval and whenever focus returns, without polling at idle.
 #[derive(Default)]
 pub struct Chrome {
+    desired: Option<Want>,
     applied: Option<Want>,
+    focused: bool,
+    attempts_left: u8,
+    next_attempt: Option<std::time::Instant>,
 }
 
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+const ATTEMPTS: u8 = 5;
+
 impl Chrome {
-    /// Keep the native frame in step with the interface.
-    ///
-    /// Asking costs a system call per window, and the colours move when the
-    /// theme does - twice a session, usually - so a frame that already agrees is
-    /// left alone. Nothing is remembered until some window has taken the
-    /// colours: the first frames run before there is one to paint.
-    pub fn follow(&mut self, want: Want) {
-        if !self.differs(want) {
-            return;
+    pub fn follow(&mut self, ctx: &egui::Context, want: Want) {
+        if self.desired != Some(want) {
+            // Set winit's preferred theme too, so later system theme messages
+            // cannot undo the application theme on Windows 10.
+            ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(if want.dark {
+                egui::SystemTheme::Dark
+            } else {
+                egui::SystemTheme::Light
+            }));
         }
-        if apply(want) {
-            self.applied = Some(want);
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(false));
+        if let Some(delay) = self.update(want, focused, std::time::Instant::now(), apply) {
+            ctx.request_repaint_after(delay);
         }
     }
 
-    /// True when the frame has to be told: it either disagrees or was never asked.
-    fn differs(&self, want: Want) -> bool {
-        self.applied != Some(want)
+    fn update(
+        &mut self,
+        want: Want,
+        focused: bool,
+        now: std::time::Instant,
+        mut apply: impl FnMut(Want) -> bool,
+    ) -> Option<std::time::Duration> {
+        if self.desired != Some(want) || (focused && !self.focused) {
+            self.desired = Some(want);
+            self.attempts_left = ATTEMPTS;
+            self.next_attempt = Some(now);
+        }
+        self.focused = focused;
+        if self.attempts_left == 0 {
+            return None;
+        }
+        let due = self.next_attempt.unwrap_or(now);
+        if now < due {
+            return Some(due - now);
+        }
+        if apply(want) {
+            self.applied = Some(want);
+        } else {
+            self.applied = None;
+        }
+        self.attempts_left -= 1;
+        if self.attempts_left == 0 && self.applied != Some(want) {
+            log::warn!(
+                "Native title bar theme could not be applied; will retry when focus returns"
+            );
+        }
+        self.next_attempt = (self.attempts_left > 0).then_some(now + RETRY_DELAY);
+        self.next_attempt.map(|due| due - now)
     }
 }
 
 /// Paint every window of ours that has a title bar.
 ///
-/// `true` once at least one window has taken the colours.
+/// `true` when visible captioned windows were found and accepted dark mode
+/// and the frame refresh. Win11-only colour attributes are optional on Win10.
 #[cfg(windows)]
 fn apply(want: Want) -> bool {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, TRUE};
     use windows_sys::Win32::Graphics::Dwm::{
         DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
-        DWMWA_USE_IMMERSIVE_DARK_MODE,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindow, GetWindowLongW, GetWindowThreadProcessId, IsWindowVisible,
-        GWL_STYLE, GW_OWNER, WS_CAPTION,
+        SetWindowPos, GWL_STYLE, GW_OWNER, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+        SWP_NOSIZE, SWP_NOZORDER, WS_CAPTION,
     };
 
     /// The windows of this process, and what the walk did to them.
@@ -71,7 +111,8 @@ fn apply(want: Want) -> bool {
         /// threads of the SSH runtime have no windows to speak of.
         process: u32,
         thread: u32,
-        touched: bool,
+        found: bool,
+        success: bool,
     }
 
     unsafe extern "system" fn each(hwnd: HWND, walk: LPARAM) -> i32 {
@@ -95,38 +136,54 @@ fn apply(want: Want) -> bool {
         let dark = i32::from(walk.want.dark);
         let caption = colorref(walk.want.caption);
         let text = colorref(walk.want.text);
-        // A Windows 10 has no caption colour and answers with an error, which is
-        // why none of these is allowed to fail the frame: the immersive flag on
-        // its own still keeps a dark interface from wearing a white hat.
-        set(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE as u32, &dark);
+        // Windows 10 before build 18985 uses attribute 19. Explicit caption,
+        // text and border colours are Windows 11 additions and remain optional.
+        let dark_applied = set_dark_attribute(|attribute| set(hwnd, attribute, &dark));
         set(hwnd, DWMWA_CAPTION_COLOR as u32, &caption);
         set(hwnd, DWMWA_TEXT_COLOR as u32, &text);
-        // The hairline around the glass, so a light title does not ring a dark
-        // window either.
         set(hwnd, DWMWA_BORDER_COLOR as u32, &caption);
-        walk.touched = true;
+        // Recalculate the non-client frame without moving, resizing or focusing
+        // the window. Win10 may otherwise keep the previous caption cached.
+        let refreshed = SetWindowPos(
+            hwnd,
+            core::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        ) != 0;
+        walk.found = true;
+        walk.success &= dark_applied && refreshed;
         1
     }
 
-    unsafe fn set(hwnd: HWND, attribute: u32, value: &impl Copy) {
-        let _ = DwmSetWindowAttribute(
+    unsafe fn set(hwnd: HWND, attribute: u32, value: &impl Copy) -> bool {
+        DwmSetWindowAttribute(
             hwnd,
             attribute,
             value as *const _ as *const core::ffi::c_void,
             core::mem::size_of_val(value) as u32,
-        );
+        ) >= 0
     }
 
     let mut walk = Walk {
         want,
         process: unsafe { GetCurrentProcessId() },
         thread: unsafe { GetCurrentThreadId() },
-        touched: false,
+        found: false,
+        success: true,
     };
     unsafe {
         EnumWindows(Some(each), &mut walk as *mut Walk as LPARAM);
     }
-    walk.touched
+    walk.found && walk.success
+}
+
+/// Older Win10 releases reject attribute 20 but accept its predecessor, 19.
+#[cfg(any(windows, test))]
+fn set_dark_attribute(mut set: impl FnMut(u32) -> bool) -> bool {
+    set(20) || set(19)
 }
 
 /// A colour in the order Windows spells a `COLORREF`: `0x00BBGGRR`.
@@ -157,34 +214,78 @@ mod tests {
         assert_eq!(colorref(Color32::BLUE), 0x00ff_0000);
     }
 
-    /// A frame that already agrees is left alone; any move in the colours, the
-    /// title or the dark flag has to be worth another look.
-    #[test]
-    fn only_a_moved_frame_is_asked_again() {
-        let want = Want {
-            caption: Color32::from_rgb(0x17, 0x1b, 0x21),
+    fn want() -> Want {
+        Want {
+            caption: Color32::BLACK,
             text: Color32::WHITE,
             dark: true,
-        };
-        let mut chrome = Chrome::default();
-        assert!(chrome.differs(want), "nothing has been asked yet");
-        chrome.applied = Some(want);
-        assert!(!chrome.differs(want), "a frame that agrees is left alone");
-        for changed in [
-            Want {
-                caption: Color32::WHITE,
-                ..want
-            },
-            Want {
-                text: Color32::BLACK,
-                ..want
-            },
-            Want {
-                dark: false,
-                ..want
-            },
-        ] {
-            assert!(chrome.differs(changed), "{changed:?} was not noticed");
         }
+    }
+
+    #[test]
+    fn win10_falls_back_only_when_modern_attribute_fails() {
+        let mut attributes = Vec::new();
+        assert!(set_dark_attribute(|attribute| {
+            attributes.push(attribute);
+            attribute == 19
+        }));
+        assert_eq!(attributes, [20, 19]);
+        attributes.clear();
+        assert!(set_dark_attribute(|attribute| {
+            attributes.push(attribute);
+            true
+        }));
+        assert_eq!(attributes, [20]);
+        assert!(!set_dark_attribute(|_| false));
+    }
+
+    #[test]
+    fn startup_retries_even_after_success_then_stops_at_idle() {
+        let mut chrome = Chrome::default();
+        let start = std::time::Instant::now();
+        let mut attempts = 0;
+        for step in 0..ATTEMPTS {
+            chrome.update(want(), true, start + RETRY_DELAY * u32::from(step), |_| {
+                attempts += 1;
+                true
+            });
+        }
+        assert_eq!(attempts, ATTEMPTS);
+        assert_eq!(chrome.applied, Some(want()));
+        assert!(chrome
+            .update(want(), true, start + RETRY_DELAY * 10, |_| panic!(
+                "idle frame retried"
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn failed_or_unavailable_window_retries_and_focus_or_theme_restarts_it() {
+        let mut chrome = Chrome::default();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            chrome.update(want(), false, start, |_| false),
+            Some(RETRY_DELAY)
+        );
+        assert_eq!(chrome.applied, None);
+        chrome.update(want(), false, start + RETRY_DELAY / 2, |_| {
+            panic!("retried too early")
+        });
+        chrome.update(want(), false, start + RETRY_DELAY, |_| true);
+        assert_eq!(chrome.applied, Some(want()));
+        chrome.attempts_left = 0;
+        assert_eq!(
+            chrome.update(want(), true, start + RETRY_DELAY * 2, |_| true),
+            Some(RETRY_DELAY)
+        );
+        chrome.attempts_left = 0;
+        let light = Want {
+            caption: Color32::WHITE,
+            text: Color32::BLACK,
+            dark: false,
+        };
+        chrome.update(light, true, start + RETRY_DELAY * 3, |_| true);
+        assert_eq!(chrome.applied, Some(light));
+        assert_eq!(chrome.attempts_left, ATTEMPTS - 1);
     }
 }

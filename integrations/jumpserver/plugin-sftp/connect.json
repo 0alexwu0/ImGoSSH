@@ -1,0 +1,13 @@
+{
+  "platform": "windows",
+  "display_name": "ImGoSSH SFTP",
+  "match_first": [],
+  "is_default": false,
+  "is_set": false,
+  "is_internal": false,
+  "executable": { "type": "user_path", "default": "", "required": true },
+  "launch": {
+    "type": "args",
+    "template": "--jumpserver --sftp --host={host} --port={port} --username={username} --password={value}"
+  }
+}
