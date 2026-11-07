@@ -8,6 +8,7 @@ use egui::{
     Align2, Color32, Context, CornerRadius, CursorIcon, FontData, FontDefinitions, FontFamily,
     FontId, FontTweak, Margin, Pos2, Rect, Response, Sense, StrokeKind, Ui, Vec2,
 };
+use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::config::{Palette, Protocol, Session, Store};
@@ -120,6 +121,24 @@ struct NamePrompt {
     kind: NameKind,
 }
 
+struct WorkspaceRunData {
+    command: String,
+    cwd: String,
+    timeout_secs: u64,
+    job_id: Option<u64>,
+    status: String,
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+    error: Option<String>,
+    running: bool,
+}
+
+struct WorkspaceRunner {
+    conn: Connection,
+    data: Arc<Mutex<WorkspaceRunData>>,
+}
+
 /// The application.
 pub struct App {
     store: Store,
@@ -137,6 +156,7 @@ pub struct App {
     editor_index: Option<usize>,
     confirm_close: Option<usize>,
     name_prompt: Option<NamePrompt>,
+    workspace_runner: Option<WorkspaceRunner>,
     show_settings: bool,
     security: Option<super::security::SecurityDialog>,
     deferred_startup: Option<Startup>,
@@ -241,6 +261,7 @@ impl App {
             editor_index: None,
             confirm_close: None,
             name_prompt: None,
+            workspace_runner: None,
             show_settings: false,
             security,
             deferred_startup,
@@ -449,6 +470,9 @@ impl App {
                     return;
                 }
             };
+            // Publish the authenticated SSH connection before setting up the
+            // optional workspace. Workspace forwarding may be unavailable or
+            // slow, but must never make the SSH session look disconnected.
             if session.auto_tunnels {
                 for tunnel in session.tunnels.clone() {
                     if let Err(err) = conn.start_tunnel(&tunnel).await {
@@ -465,6 +489,18 @@ impl App {
                 });
             }
             ctx.request_repaint();
+
+            if session.workspace.enabled {
+                let workspace_conn = conn.clone();
+                let workspace_config = session.workspace.clone();
+                let workspace_ctx = ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = workspace_conn.start_workspace(&workspace_config).await {
+                        log::warn!("workspace setup failed; keeping SSH connected: {err:#}");
+                    }
+                    workspace_ctx.request_repaint();
+                });
+            }
 
             if !want_shell {
                 return;
@@ -522,6 +558,18 @@ impl App {
             monitor.attach(conn.clone(), DEFAULT_INTERVAL, move || {
                 repaint.request_repaint();
             });
+            ctx.request_repaint();
+            if session.workspace.enabled {
+                let workspace_conn = conn.clone();
+                let workspace_config = session.workspace.clone();
+                let workspace_ctx = ctx.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = workspace_conn.start_workspace(&workspace_config).await {
+                        log::warn!("workspace setup failed; keeping SSH connected: {err:#}");
+                    }
+                    workspace_ctx.request_repaint();
+                });
+            }
             let remote = session.remote_path.clone();
             let local = PathBuf::from(&session.local_path);
             if local.as_os_str().is_empty() || remote.is_empty() {
@@ -2013,6 +2061,78 @@ impl App {
         let index = self.active;
         let show_browser = self.tabs[index].show_browser;
         let kind = self.tabs[index].kind;
+        let workspace_conn = self.tabs[index].conn.lock().unwrap().as_ref().cloned();
+
+        if let Some(error) = self.tabs[index]
+            .conn
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(Connection::workspace_error)
+        {
+            let message = if error.contains("sshfs is not installed") {
+                "反向工作区未挂载：需要在服务器安装 sshfs".to_string()
+            } else {
+                format!("反向工作区未启用：{error}")
+            };
+            ui.colored_label(Color32::YELLOW, message);
+        }
+
+        if let Some(info) = workspace_conn.as_ref().and_then(Connection::workspace_info) {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(t!("Reverse workspace"));
+                if info.mounts.len() > 1 {
+                    ui.label(t!("{0} mounts", info.mounts.len()));
+                }
+                if !info.url.is_empty() {
+                    ui.label(&info.url);
+                }
+                if !info.url.is_empty() && ui.button(t!("Copy server setup command")).clicked() {
+                    ui.ctx().copy_text(info.setup_command());
+                }
+                if info.allow_exec
+                    && ui.button(t!("Run on client")).clicked()
+                    && self.workspace_runner.is_none()
+                {
+                    if let Some(conn) = workspace_conn.clone() {
+                        self.workspace_runner = Some(WorkspaceRunner {
+                            conn,
+                            data: Arc::new(Mutex::new(WorkspaceRunData {
+                                command: String::new(),
+                                cwd: String::new(),
+                                timeout_secs: 300,
+                                job_id: None,
+                                status: String::new(),
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                exit_code: None,
+                                error: None,
+                                running: false,
+                            })),
+                        });
+                    }
+                }
+            });
+            for mount in &info.mounts {
+                // Windows canonical paths may carry the internal long-path
+                // prefix. It is useful to the filesystem but confusing in a
+                // status message, so show the configured path to the user.
+                let local_path = mount
+                    .local_path
+                    .strip_prefix("\\\\?\\")
+                    .unwrap_or(&mount.local_path);
+                if mount.mounted {
+                    ui.label(t!("Mounted {0}:{1}", local_path, mount.remote_path));
+                } else if let Some(error) = &mount.error {
+                    let message = if error.contains("sshfs is not installed") {
+                        format!("{}：挂载失败，需要在服务器安装 sshfs", mount.remote_path)
+                    } else {
+                        format!("{}：挂载失败：{}", mount.remote_path, error)
+                    };
+                    ui.colored_label(Color32::YELLOW, message);
+                }
+            }
+        }
 
         if show_browser && kind == TabKind::Terminal {
             let queue = self.queue.clone();
@@ -2670,6 +2790,7 @@ impl App {
                 self.pending_ui(ui);
                 self.confirm_close_ui(ui);
                 self.term_menu_ui(ui);
+                self.workspace_runner_ui(ui);
 
                 if self.show_settings {
                     let mut settings_open = true;
@@ -2806,6 +2927,147 @@ impl App {
                 ));
             }
             self.dirty = false;
+        }
+    }
+
+    fn workspace_runner_ui(&mut self, ctx: &Context) {
+        let Some(runner) = &self.workspace_runner else {
+            return;
+        };
+        let data = runner.data.clone();
+        let mut close = false;
+        egui::Modal::new(egui::Id::new("workspace-runner")).show(ctx, |ui| {
+            ui.set_width(620.0);
+            ui.heading(t!("Run on client"));
+            let mut start = None;
+            {
+                let mut state = data.lock().unwrap();
+                ui.label(t!("Command"));
+                ui.add_enabled(
+                    !state.running,
+                    egui::TextEdit::singleline(&mut state.command).hint_text("python src/main.py"),
+                );
+                ui.label(t!("Working directory (relative to shared folder)"));
+                ui.add_enabled(
+                    !state.running,
+                    egui::TextEdit::singleline(&mut state.cwd).hint_text("."),
+                );
+                ui.horizontal(|ui| {
+                    ui.label(t!("Timeout (seconds)"));
+                    ui.add_enabled(
+                        !state.running,
+                        egui::DragValue::new(&mut state.timeout_secs).range(1..=3600),
+                    );
+                    if ui
+                        .add_enabled(
+                            !state.running && !state.command.trim().is_empty(),
+                            egui::Button::new(t!("Run")),
+                        )
+                        .clicked()
+                    {
+                        state.error = None;
+                        state.stdout.clear();
+                        state.stderr.clear();
+                        state.status = t!("starting...").to_string();
+                        state.running = true;
+                        start =
+                            Some((state.command.clone(), state.cwd.clone(), state.timeout_secs));
+                    }
+                    if ui.button(t!("Close")).clicked() && !state.running {
+                        close = true;
+                    }
+                });
+                if let Some(error) = &state.error {
+                    ui.colored_label(Color32::YELLOW, error);
+                }
+                if !state.status.is_empty() {
+                    ui.label(format!(
+                        "{} {}",
+                        state.status,
+                        state
+                            .exit_code
+                            .map(|code| format!("(exit {code})"))
+                            .unwrap_or_default()
+                    ));
+                }
+                ui.columns(2, |columns| {
+                    columns[0].label(t!("Output"));
+                    columns[0].add(
+                        egui::TextEdit::multiline(&mut state.stdout)
+                            .desired_rows(12)
+                            .interactive(false),
+                    );
+                    columns[1].label(t!("Errors"));
+                    columns[1].add(
+                        egui::TextEdit::multiline(&mut state.stderr)
+                            .desired_rows(12)
+                            .interactive(false),
+                    );
+                });
+            }
+            if let Some((command, cwd, timeout)) = start {
+                let conn = runner.conn.clone();
+                let repaint = ctx.clone();
+                let state = data.clone();
+                tokio::spawn(async move {
+                    let result = conn.run_workspace(&command, &cwd, timeout).await;
+                    match result {
+                        Ok(id) => {
+                            state.lock().unwrap().job_id = Some(id);
+                            loop {
+                                match conn.workspace_job(id).await {
+                                    Ok(value) => {
+                                        let done = value
+                                            .get("status")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("failed")
+                                            != "running";
+                                        let mut current = state.lock().unwrap();
+                                        current.status = value
+                                            .get("status")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("failed")
+                                            .into();
+                                        current.stdout = value
+                                            .get("stdout")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .into();
+                                        current.stderr = value
+                                            .get("stderr")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .into();
+                                        current.exit_code = value
+                                            .get("exit_code")
+                                            .and_then(Value::as_i64)
+                                            .map(|v| v as i32);
+                                        if done {
+                                            current.running = false;
+                                            break;
+                                        }
+                                    }
+                                    Err(error) => {
+                                        state.lock().unwrap().error = Some(format!("{error:#}"));
+                                        state.lock().unwrap().running = false;
+                                        break;
+                                    }
+                                }
+                                repaint.request_repaint();
+                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                            }
+                        }
+                        Err(error) => {
+                            state.lock().unwrap().error = Some(format!("{error:#}"));
+                            state.lock().unwrap().running = false;
+                        }
+                    }
+                    repaint.request_repaint();
+                });
+            }
+        });
+        if close {
+            self.workspace_runner = None;
         }
     }
     fn session_editor(&mut self, ui: &mut Ui) {

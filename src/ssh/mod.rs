@@ -12,6 +12,7 @@ pub mod local;
 pub mod monitor;
 pub mod sftp;
 pub mod transfer;
+pub mod workspace;
 
 use client::TerminalHandle;
 use local::LocalPty;

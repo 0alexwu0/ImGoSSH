@@ -20,10 +20,11 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use serde_json::Value;
 use vt100::MouseProtocolMode;
 
 use imgossh::cli::{self, ConnectArgs};
-use imgossh::config::TunnelKind;
+use imgossh::config::{TunnelKind, WorkspaceConfig, WorkspaceMapping};
 use imgossh::ssh::client::{Connection, TermEvent, TermSink, TerminalHandle};
 use imgossh::terminal::{
     encode_mouse, Emulator, InputEncoder, KeyCode, Mods, MouseReport, TermState, MOUSE_LEFT,
@@ -75,6 +76,27 @@ struct Args {
     /// TERM value sent to the server
     #[arg(long, default_value = "xterm-256color")]
     term: String,
+    /// Share a local directory with the SSH server for this connection
+    #[arg(long)]
+    share: Option<PathBuf>,
+    /// Allow the server to modify files in --share
+    #[arg(long, requires = "share")]
+    share_write: bool,
+    /// Allow programs to run on this computer with this user's privileges
+    #[arg(long, requires = "share")]
+    share_exec: bool,
+    /// Run a command on the client computer through the shared workspace
+    #[arg(long, requires = "share")]
+    share_run: Option<String>,
+    /// Working directory for --share-run, relative to the shared directory
+    #[arg(long, requires = "share-run", default_value = "")]
+    share_cwd: String,
+    /// Timeout in seconds for --share-run
+    #[arg(long, requires = "share-run", default_value_t = 300)]
+    share_timeout: u64,
+    /// Server loopback port for --share (0 allocates a free port)
+    #[arg(long, requires = "share", default_value_t = 0)]
+    share_port: u16,
 }
 
 /// Restores the console when the shell exits (including on panic).
@@ -117,6 +139,95 @@ fn main() -> Result<()> {
 
     let runtime = cli::runtime()?;
     let conn = connect.connect(&runtime, &host)?;
+    if let Some(root) = &args.share {
+        let workspace_config = WorkspaceConfig {
+            enabled: true,
+            mount: true,
+            mappings: vec![WorkspaceMapping {
+                local_path: root.to_string_lossy().into_owned(),
+                remote_path: "/workspace".into(),
+            }],
+            root: root.to_string_lossy().into_owned(),
+            remote_port: args.share_port,
+            writable: args.share_write,
+            allow_exec: args.share_exec,
+        };
+        let info = match runtime.block_on(conn.start_workspace(&workspace_config)) {
+            Ok(info) => Some(info),
+            Err(error) => {
+                eprintln!("Workspace setup failed; SSH connection remains active: {error:#}");
+                None
+            }
+        };
+        if let Some(info) = info {
+            if info.mounts.is_empty() {
+                eprintln!("Shared workspace: {} (write={}, exec={})\nRun on the SSH server:\n{}\nThen: igworkspace info", info.root, info.writable, info.allow_exec, info.setup_command());
+            } else {
+                eprintln!(
+                    "Workspace mounts (write={}, exec={}):",
+                    info.writable, info.allow_exec
+                );
+                for mount in &info.mounts {
+                    match (&mount.mounted, &mount.error) {
+                        (true, _) => {
+                            eprintln!("  {} <- {} [mounted]", mount.remote_path, mount.local_path)
+                        }
+                        (false, Some(error)) => eprintln!(
+                            "  {} <- {} [failed: {}]",
+                            mount.remote_path, mount.local_path, error
+                        ),
+                        (false, None) => eprintln!(
+                            "  {} <- {} [not mounted]",
+                            mount.remote_path, mount.local_path
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(command) = &args.share_run {
+        let id =
+            runtime.block_on(conn.run_workspace(command, &args.share_cwd, args.share_timeout))?;
+        eprintln!("[client job {id}]");
+        let code = runtime.block_on(async {
+            let mut previous_stdout = String::new();
+            let mut previous_stderr = String::new();
+            loop {
+                let job = conn.workspace_job(id).await?;
+                let stdout = job.get("stdout").and_then(Value::as_str).unwrap_or("");
+                let stderr = job.get("stderr").and_then(Value::as_str).unwrap_or("");
+                if stdout.starts_with(&previous_stdout) {
+                    print!("{}", &stdout[previous_stdout.len()..]);
+                } else if stdout != previous_stdout {
+                    print!("{}", stdout);
+                }
+                if stderr.starts_with(&previous_stderr) {
+                    eprint!("{}", &stderr[previous_stderr.len()..]);
+                } else if stderr != previous_stderr {
+                    eprint!("{}", stderr);
+                }
+                std::io::stdout().flush()?;
+                std::io::stderr().flush()?;
+                previous_stdout = stdout.to_string();
+                previous_stderr = stderr.to_string();
+                let status = job
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("failed");
+                if status != "running" {
+                    let exit = job.get("exit_code").and_then(Value::as_i64).unwrap_or(1);
+                    eprintln!("\n[client job {id}: {status}, exit={exit}]");
+                    break Ok::<i32, anyhow::Error>(exit as i32);
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })?;
+        if code != 0 {
+            std::process::exit(code);
+        }
+        return Ok(());
+    }
 
     if args.exec {
         let command = args.command.clone().unwrap_or_default();

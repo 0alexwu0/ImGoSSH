@@ -7,7 +7,9 @@
 
 **ImGoSSH 是一个用 Rust 编写的原生 SSH / SFTP / SCP 工作站。**
 
-它把多标签终端、会话管理、SFTP 文件浏览器、传输队列和 SSH 隧道放在一个桌面应用里，同时提供三个 OpenSSH 风格的命令行工具：
+它把多标签终端、会话管理、SFTP 文件浏览器、传输队列、SSH 隧道和反向工作区放在一个桌面应用里，同时提供三个 OpenSSH 风格的命令行工具。反向工作区可以让服务器访问客户端指定目录，并将代码交给客户端电脑运行、返回日志和退出码。
+
+包含以下程序：
 
 - `imgossh`：图形客户端
 - `igssh`：交互式 SSH shell 或单条远程命令
@@ -18,20 +20,20 @@
 
 GUI 与 CLI 共用 `src/ssh`、`src/terminal` 和配置代码。连接、认证、主机密钥和文件传输因此保持一致。
 
-[下载](#下载) · [开始使用](#开始使用) · [GUI 功能](#gui-功能) · [命令行工具](#命令行工具) · [源码构建](#从源码构建) · [配置](#配置与数据) · [开发与测试](#测试)
+[下载](#下载) · [开始使用](#开始使用) · [反向工作区](#反向工作区) · [GUI 功能](#gui-功能) · [命令行工具](#命令行工具) · [源码构建](#从源码构建) · [配置](#配置与数据) · [开发与测试](#测试)
 
 ## 下载
 
-最新版本：[v0.2.2](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.2.2)
+最新版本：[v0.2.3](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.2.3)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.2/ImGoSSH-0.2.2-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
-每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md` 和 `integrations/jumpserver` 连接器及安装说明。Release 页面同时提供 SHA-256 校验值。
+每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md`、使用文档、JumpServer 连接器和反向工作区辅助脚本。Release 页面同时提供 SHA-256 校验值。
 
 Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发者签名和公证，首次运行时可能需要在「系统设置 → 隐私与安全性」中允许打开，或执行：
 
@@ -39,14 +41,15 @@ Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发�
 xattr -dr com.apple.quarantine <解压目录>
 ```
 
-## v0.2.2 更新
+## v0.2.3 更新
 
-- 新增 JumpServer SSH / SFTP 接入，最低支持 Windows 上的 JumpServer Client 2.1.4，并适配 v4.1.9 索引插件。
-- 正常启动时自动检查两项连接配置，缺少时关闭对应桌面客户端，备份后补齐；已有完整配置时保持不变。此前仅有 SSH 的配置可自动升级。
-- 新增 GUI 的 `--sftp` 启动参数，直接打开文件浏览器。JumpServer 临时凭据仅用于当前连接，不写入已保存会话。
-- 修正 Windows 标题栏主题同步：增加旧版 Win10 接口回退、启动重试和切回窗口时刷新，处理偶发颜色不一致。
+- 新增反向工作区，可配置多个客户端目录及各自的 Linux 服务器挂载位置，例如 `E:\AI\Strata-data` → `/data/sss`。
+- 支持通过 sshfs/FUSE 真实挂载，服务器编辑器和命令可以直接访问目录；缺少 sshfs 或挂载失败时保持 SSH 连接，并显示安装或错误提示。
+- 新增 GUI“在本机运行”和服务器端 `igworkspace` 命令，可在客户端运行程序，读取实时日志、退出码，后台执行或取消任务。
+- 服务器端运行入口只需 Shell、curl 和常见系统工具，无需 Python 或 jq；支持中文命令，日志滚动后按字节偏移继续读取。
+- 修正 SSH 远程转发的目标路由，让工作区控制通道和已有远程隧道连接到指定的客户端端口。
 
-详细说明见 [v0.2.2 发布说明](docs/release-0.2.2.md)。
+详细说明见 [v0.2.3 发布说明](docs/release-0.2.3.md)。上一版本的 JumpServer 集成及 Windows 标题栏改进见 [v0.2.2 发布说明](docs/release-0.2.2.md)。
 
 ## 开始使用
 
@@ -98,6 +101,32 @@ JumpServer 桌面客户端，备份并写入配置。两项均已配置时不关
 - 上传文件夹时递归保留目录结构；文件夹中的每个文件单独显示大小、速率、状态和进度。
 - 空目录、空文件和嵌套目录都会保留；传输可以单独取消，进度列表支持滚动查看。
 - 属性窗口支持查看大小、时间和权限，并可直接修改远端权限。
+
+### 反向工作区
+
+在 GUI 登录服务器 A 后，可以让 A 访问客户端电脑的指定目录，并在 A 的 SSH 终端提交命令，让程序在客户端执行。
+
+1. 编辑会话 →「反向工作区」，启用共享，添加一个或多个“客户端 → 服务器”目录映射。
+2. 需要真实挂载时勾选「在服务器上挂载目录」；需要编辑文件或执行程序时，分别勾选对应权限。
+3. 保存并重新连接。界面显示每个目录的挂载状态，例如「已挂载 E:\AI\Strata-data:/data/sss」。
+4. 点击终端上方「复制服务器端配置命令」，粘贴到服务器的 POSIX shell 执行一次；随后在同一 shell 中使用：
+
+```sh
+# 以下命令在服务器 A 的 SSH 终端输入，实际在 Windows 客户端运行
+igworkspace run 'hostname; Get-Location' --cwd /data/sss
+igworkspace run 'python main.py' --cwd /data/sss --timeout 600
+
+# 后台运行后，使用返回的任务 ID 查看日志或取消
+igworkspace run 'python main.py' --cwd /data/sss --detach
+igworkspace logs 1 --follow
+igworkspace cancel 1
+```
+
+服务器需要允许 SSH 远程 TCP 转发；真实挂载还需要 Linux、sshfs/FUSE 和挂载权限。缺少 sshfs 不会阻止 SSH 登录，运行通道仍可使用。`igworkspace` 只依赖 Shell、curl 和常见系统工具，不需要服务器安装 Python 或 jq；运行 Python 等程序时，解释器只需安装在实际执行程序的客户端电脑上。Windows 客户端使用 PowerShell，Unix 客户端使用 `/bin/sh`。
+
+也可以点击 GUI「在本机运行」提交命令和查看日志。省略 `--cwd` 使用第一个映射目录；重新连接或打开新 shell 后需重新执行配置命令。配置命令中的 `curl --noproxy '*'` 只让本次工作区请求绕过代理，不修改服务器的代理环境变量。
+
+详细说明：[目录挂载与接口](docs/reverse-workspace.md) · [从服务器 SSH 终端运行客户端程序](docs/server-client-execution.md)。
 
 ### 传输、隧道与监控
 
@@ -157,6 +186,16 @@ igssh -D 1080 user@example.com
 ```
 
 常用选项包括 `-l`、`-p`、`-i`、`-w`、`-a`、`--keepalive` 和 `--term`。
+
+共享客户端目录，默认挂载到 Linux 服务器的 `/workspace`：
+
+```powershell
+igssh user@example.com --share 'E:\AI\Strata-data' --share-write --share-exec
+# 从客户端命令行提交本机程序，保持 SSH 连接直至运行完成
+igssh user@example.com --share 'E:\AI\Strata-data' --share-exec --share-run 'python main.py' --share-timeout 600
+```
+
+`--share-write` 和 `--share-exec` 分别授权文件修改及本机执行；`--share-cwd` 指定工作目录，`--share-port` 指定服务器控制端口（默认自动分配）。GUI 支持配置多个目录和各自的挂载位置。
 
 ### `igscp`
 
@@ -223,7 +262,7 @@ Release 构建会在 `target/release/` 生成四个程序。Windows 构建会尝
 | 文件 | 内容 |
 | --- | --- |
 | `config.toml` | 主题、字体、回滚、默认会话、窗口状态和更新设置 |
-| `sessions.toml` | 会话、文件夹、启动脚本和隧道；启用加密后为加密二进制文件 |
+| `sessions.toml` | 会话、文件夹、启动脚本、隧道和反向工作区映射及权限；启用加密后为加密二进制文件 |
 | `known_hosts` | ImGoSSH 使用的主机密钥库 |
 
 设置 `IMGOSSH_HOME` 可以把整个数据目录移动到其他位置，例如 U 盘。调试时设置 `RUST_LOG=debug`。
@@ -255,6 +294,21 @@ kind = "local"
 listen_port = 8080
 remote_host = "localhost"
 remote_port = 80
+
+[session.workspace]
+enabled = true
+mount = true
+writable = true
+allow_exec = true
+remote_port = 0
+
+[[session.workspace.mappings]]
+local_path = "E:/AI/Strata-data"
+remote_path = "/data/sss"
+
+[[session.workspace.mappings]]
+local_path = "E:/AI/tools"
+remote_path = "/data/tools"
 ```
 
 ## 技术架构
@@ -266,6 +320,7 @@ ImGoSSH 不依赖本机 OpenSSH、Electron 或 WebView。SSH 协议、SFTP、终
 | 模块 | 作用 |
 | --- | --- |
 | `src/ssh/client.rs` | SSH 连接 actor、认证、shell、exec、SFTP 和隧道 |
+| `src/ssh/workspace.rs` | 客户端目录共享、反向 SFTP 挂载、文件 API 和本机任务执行 |
 | `src/ssh/sftp.rs` | 远程目录、属性、权限和文件操作 |
 | `src/ssh/transfer.rs` | 上传下载队列、逐文件进度、速率和取消 |
 | `src/ssh/hostkeys.rs` | OpenSSH 主机密钥读写与匹配 |
@@ -294,6 +349,8 @@ powershell -NoProfile -File integrations/jumpserver/Test-Install.ps1
 powershell -NoProfile -File integrations/jumpserver/Test-AutoConfigure.ps1
 ```
 
+反向工作区测试使用本地模拟 SSH 服务器，覆盖目录读写、多个映射、权限与越界路径、远程转发、本机程序运行、日志、取消、超时及断线清理。Shell 集成测试会限制服务器侧的 `PATH`，确认找不到 Python、Python3 或 jq 时仍能运行；Windows 测试需要 Git for Windows，非默认安装位置可设置 `IMGOSSH_TEST_GIT`。这些测试不执行真实 Linux FUSE 挂载。
+
 [Release 工作流](.github/workflows/release.yml) 配置了 Windows、Linux 和两种 macOS 架构的构建与打包，并为原生目标配置工作区测试；macOS Intel 使用交叉编译，不运行测试。
 
 需要真实 SSH 服务器的测试默认忽略。配置环境变量后运行：
@@ -312,6 +369,7 @@ cargo test --test live_server -- --ignored --nocapture --test-threads=1
 - 首次连接会校验主机密钥；指纹变化时会阻断连接并要求确认。
 - 主机密钥会从应用数据目录和 `~/.ssh/known_hosts` 读取，新接受的密钥写入应用数据目录；目前不匹配 OpenSSH 的哈希主机名条目。
 - 文件传输使用 SFTP 子系统，服务器需要启用 SFTP 服务。
+- 反向工作区默认关闭，文件写入与本机执行分别授权。执行使用客户端当前用户的权限，工作目录不构成沙箱；仅向可信服务器启用执行权限。连接断开后取消运行中的任务，并清理共享服务。
 - JumpServer 接入目前仅提供 Windows 配置适配。SSH/SFTP 已通过本地网关协议测试，真实资产权限、传输和审计仍需在实际部署中验证。
 - JumpServer Client 2.1.4 的接口通过进程参数传递临时令牌，本机有相应权限的进程可能读取；旧版配置会借用 XShell / WinSCP 图标槽位，卸载可恢复。
 - Win10 标题栏修复已通过回归测试，当前开发机为 Win11，仍需在发生问题的 Win10 环境确认。

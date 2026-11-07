@@ -191,11 +191,52 @@ pub struct Session {
     pub auto_tunnels: bool,
     pub tunnels: Vec<Tunnel>,
 
+    /// Opt-in directory access and command execution from the connected server.
+    pub workspace: WorkspaceConfig,
+
     /// Remote directory for SFTP / SCP sessions.
     pub remote_path: String,
     /// Local directory for SFTP / SCP sessions.
     pub local_path: String,
     pub scp_direction: ScpDirection,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct WorkspaceConfig {
+    pub enabled: bool,
+    /// Automatically create real server-side FUSE mounts for the mappings.
+    pub mount: bool,
+    /// Client directories exposed to the server. Older sessions use `root`.
+    pub mappings: Vec<WorkspaceMapping>,
+    pub root: String,
+    /// Zero asks sshd to allocate a free loopback port.
+    pub remote_port: u16,
+    pub writable: bool,
+    pub allow_exec: bool,
+}
+
+/// One client directory and its desired path on the server.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct WorkspaceMapping {
+    pub local_path: String,
+    pub remote_path: String,
+}
+
+impl WorkspaceConfig {
+    pub fn effective_mappings(&self) -> Vec<WorkspaceMapping> {
+        if !self.mappings.is_empty() {
+            return self.mappings.clone();
+        }
+        if self.root.trim().is_empty() {
+            return Vec::new();
+        }
+        vec![WorkspaceMapping {
+            local_path: self.root.clone(),
+            remote_path: "/workspace".into(),
+        }]
+    }
 }
 
 impl Session {

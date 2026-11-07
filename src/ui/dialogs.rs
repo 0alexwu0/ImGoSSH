@@ -2,7 +2,7 @@
 
 use egui::{Color32, CornerRadius, FontId, RichText, Sense, Ui, Vec2};
 
-use crate::config::{Config, Protocol, Session, Tunnel, TunnelKind};
+use crate::config::{Config, Protocol, Session, Tunnel, TunnelKind, WorkspaceMapping};
 use crate::i18n::{tr, Lang};
 use crate::ssh::client::{Challenge, HostKeyInfo, Reply, Trust};
 use crate::ssh::transfer::{Phase, Queue};
@@ -24,6 +24,7 @@ enum EditorTab {
     Session,
     Tunnel,
     Advanced,
+    Workspace,
 }
 
 /// The session properties window: create a new session or edit a saved one.
@@ -65,17 +66,18 @@ impl SessionEditor {
             .default_size(Vec2::new(520.0, 420.0))
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ui.ctx(), |ui| {
-                // A segmented control: three pages of one form.
+                // A segmented control for the session form.
                 let pages = [
                     (t!("Session"), EditorTab::Session),
                     (t!("Tunnel"), EditorTab::Tunnel),
                     (t!("Advanced SSH settings"), EditorTab::Advanced),
+                    (t!("Reverse workspace"), EditorTab::Workspace),
                 ];
                 let current = pages
                     .iter()
                     .position(|(_, page)| *page == self.tab)
                     .unwrap_or(0);
-                let labels: [&str; 3] = [pages[0].0, pages[1].0, pages[2].0];
+                let labels: Vec<&str> = pages.iter().map(|(label, _)| *label).collect();
                 if let Some(index) = theme::segmented(ui, &labels, current) {
                     self.tab = pages[index].1;
                 }
@@ -88,6 +90,7 @@ impl SessionEditor {
                         EditorTab::Session => self.session_tab(ui),
                         EditorTab::Tunnel => self.tunnel_tab(ui),
                         EditorTab::Advanced => self.advanced_tab(ui),
+                        EditorTab::Workspace => self.workspace_tab(ui),
                     });
 
                 theme::hairline(ui);
@@ -318,6 +321,59 @@ impl SessionEditor {
         }
         ui.separator();
         ui.label(t!("Local (L): listen here, forward to the remote target.\nRemote (R): listen on the server, forward back here.\nDynamic (D): SOCKS5 proxy on the local port."));
+    }
+
+    fn workspace_tab(&mut self, ui: &mut Ui) {
+        let remote = self.session.protocol.is_remote();
+        let workspace = &mut self.session.workspace;
+        ui.add_enabled_ui(remote, |ui| {
+            ui.checkbox(&mut workspace.enabled, t!("Share a local directory with the server"));
+            ui.add_enabled_ui(workspace.enabled, |ui| {
+                ui.checkbox(&mut workspace.mount, t!("Mount directories on the server"));
+                ui.weak(t!("Requires sshfs and FUSE on the Linux server, and SSH remote forwarding."));
+                // Keep the old single-root fields usable while presenting the
+                // new multi-directory mapping editor.
+                if workspace.mappings.is_empty() && !workspace.root.trim().is_empty() {
+                    workspace.mappings.push(WorkspaceMapping {
+                        local_path: workspace.root.clone(),
+                        remote_path: "/workspace".into(),
+                    });
+                }
+                ui.label(t!("Directory mappings (client → server)"));
+                let mut remove = None;
+                for (index, mapping) in workspace.mappings.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.add_sized([180.0, theme::field_height(ui)], theme::field(&mut mapping.local_path));
+                        if ui.button(t!("Browse")).clicked() {
+                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                                mapping.local_path = path.to_string_lossy().into_owned();
+                            }
+                        }
+                        ui.label("→");
+                        ui.add_sized([150.0, theme::field_height(ui)], theme::field(&mut mapping.remote_path).hint_text("/workspace/app"));
+                        if ui.button(t!("Remove")).clicked() { remove = Some(index); }
+                    });
+                }
+                if let Some(index) = remove { workspace.mappings.remove(index); }
+                if ui.button(t!("+ Add directory mapping")).clicked() {
+                    workspace.mappings.push(WorkspaceMapping {
+                        local_path: String::new(),
+                        remote_path: format!("/workspace/{}", workspace.mappings.len() + 1),
+                    });
+                }
+                ui.add_space(8.0);
+                ui.checkbox(&mut workspace.writable, t!("Allow file modifications"));
+                ui.checkbox(&mut workspace.allow_exec, t!("Allow programs to run on this computer"));
+                ui.weak(t!("Programs run with your account permissions and may access files outside this directory."));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.label(t!("Server port (0 = automatic)"));
+                    ui.add(egui::DragValue::new(&mut workspace.remote_port).range(0..=u16::MAX));
+                });
+            });
+            ui.separator();
+            ui.label(t!("After connecting, copy the server setup command above the terminal to access files, run programs and inspect logs."));
+        });
     }
 
     fn advanced_tab(&mut self, ui: &mut Ui) {
@@ -1399,7 +1455,12 @@ mod tests {
 
     #[test]
     fn every_page_of_the_properties_dialog_lays_out() {
-        for tab in [EditorTab::Session, EditorTab::Tunnel, EditorTab::Advanced] {
+        for tab in [
+            EditorTab::Session,
+            EditorTab::Tunnel,
+            EditorTab::Advanced,
+            EditorTab::Workspace,
+        ] {
             let ctx = egui::Context::default();
             let mut editor = SessionEditor::new(Session::default(), "properties");
             editor.tab = tab;

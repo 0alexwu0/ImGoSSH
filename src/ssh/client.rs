@@ -5,6 +5,7 @@
 //! keeps the UI thread free while still allowing many shell / SFTP / tunnel
 //! channels to share a single TCP connection.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,13 +18,20 @@ use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate
 use russh::MethodKind;
 use russh::{Channel, ChannelMsg, Disconnect, Pty};
 use russh_sftp::client::SftpSession;
+use serde_json::{json, Value};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 
-use crate::config::{Tunnel, TunnelKind};
+use crate::config::{Tunnel, TunnelKind, WorkspaceConfig};
 use crate::ssh::hostkeys;
+use crate::ssh::workspace::{
+    mount_command, start_sftp_service, unmount_command, SftpService, WorkspaceInfo,
+    WorkspaceService,
+};
+
+type RemoteTargets = Arc<Mutex<HashMap<u16, (String, u16)>>>;
 
 // ---------------------------------------------------------------------------
 // Interaction with the user (passwords, passphrases, host keys)
@@ -207,6 +215,10 @@ impl ExecResult {
     pub fn stdout_text(&self) -> String {
         String::from_utf8_lossy(&self.stdout).into_owned()
     }
+
+    pub fn stderr_text(&self) -> String {
+        String::from_utf8_lossy(&self.stderr).into_owned()
+    }
 }
 // ---------------------------------------------------------------------------
 // russh handler
@@ -217,6 +229,7 @@ struct Handler {
     host: String,
     port: u16,
     banner: Arc<Mutex<Option<String>>>,
+    remote_targets: RemoteTargets,
 }
 
 impl client::Handler for Handler {
@@ -267,15 +280,21 @@ impl client::Handler for Handler {
     async fn server_channel_open_forwarded_tcpip(
         &mut self,
         channel: Channel<Msg>,
-        connected_address: &str,
+        _connected_address: &str,
         connected_port: u32,
         _originator_address: &str,
         _originator_port: u32,
         reply: client::ChannelOpenHandle,
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
-        let host = connected_address.to_string();
-        let port = connected_port as u16;
+        let target = u16::try_from(connected_port)
+            .ok()
+            .and_then(|port| self.remote_targets.lock().unwrap().get(&port).cloned());
+        log::debug!("workspace/forwarded channel port={connected_port} target={target:?}");
+        let Some((host, port)) = target else {
+            drop(reply);
+            return Ok(());
+        };
         tokio::spawn(async move {
             match TcpStream::connect((host.as_str(), port)).await {
                 Ok(socket) => {
@@ -315,6 +334,20 @@ enum Command {
     StartTunnel {
         tunnel: Tunnel,
         reply: oneshot::Sender<Result<()>>,
+    },
+    StartWorkspace {
+        config: WorkspaceConfig,
+        reply: oneshot::Sender<Result<WorkspaceInfo>>,
+    },
+    RunWorkspace {
+        command: String,
+        cwd: String,
+        timeout_secs: u64,
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    WorkspaceJob {
+        id: u64,
+        reply: oneshot::Sender<Result<Value>>,
     },
     /// A locally accepted socket that must be wired to a `direct-tcpip` channel.
     Pump {
@@ -372,6 +405,8 @@ pub struct Connection {
     banner: Arc<Mutex<Option<String>>>,
     sftp: Arc<AsyncMutex<Option<Arc<SftpSession>>>>,
     tunnels: Arc<Mutex<Vec<Tunnel>>>,
+    workspace: Arc<Mutex<Option<WorkspaceInfo>>>,
+    workspace_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Alias kept for readability at call sites.
@@ -397,11 +432,13 @@ impl Connection {
             ..Default::default()
         });
         let banner = Arc::new(Mutex::new(None));
+        let remote_targets = Arc::new(Mutex::new(HashMap::new()));
         let handler = Handler {
             prompter: prompter.clone(),
             host: host.clone(),
             port,
             banner: banner.clone(),
+            remote_targets: remote_targets.clone(),
         };
 
         let mut handle = client::connect(config, (host.as_str(), port), handler)
@@ -428,6 +465,8 @@ impl Connection {
         let sftp: Arc<AsyncMutex<Option<Arc<SftpSession>>>> = Arc::new(AsyncMutex::new(None));
         let tunnels: Arc<Mutex<Vec<Tunnel>>> = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = mpsc::unbounded_channel();
+        let workspace = Arc::new(Mutex::new(None));
+        let workspace_error = Arc::new(Mutex::new(None));
 
         tokio::spawn(actor(
             handle,
@@ -437,6 +476,9 @@ impl Connection {
             error.clone(),
             sftp.clone(),
             tunnels.clone(),
+            remote_targets,
+            workspace.clone(),
+            workspace_error.clone(),
         ));
 
         Ok(Self {
@@ -449,6 +491,8 @@ impl Connection {
             banner,
             sftp,
             tunnels,
+            workspace,
+            workspace_error,
         })
     }
 
@@ -555,6 +599,50 @@ impl Connection {
         self.tunnels.lock().unwrap().clone()
     }
 
+    /// Share one selected local directory for the lifetime of this connection.
+    pub async fn start_workspace(&self, config: &WorkspaceConfig) -> Result<WorkspaceInfo> {
+        let (reply, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::StartWorkspace {
+                config: config.clone(),
+                reply,
+            })
+            .map_err(|_| anyhow!("connection closed"))?;
+        rx.await.map_err(|_| anyhow!("connection closed"))?
+    }
+
+    pub fn workspace_info(&self) -> Option<WorkspaceInfo> {
+        self.workspace.lock().unwrap().clone()
+    }
+
+    pub fn workspace_error(&self) -> Option<String> {
+        self.workspace_error.lock().unwrap().clone()
+    }
+
+    /// Start a command through the local workspace service. This keeps the
+    /// command runner inside the client UI; no helper script is required on
+    /// the SSH server.
+    pub async fn run_workspace(&self, command: &str, cwd: &str, timeout_secs: u64) -> Result<u64> {
+        let (reply, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::RunWorkspace {
+                command: command.to_string(),
+                cwd: cwd.to_string(),
+                timeout_secs,
+                reply,
+            })
+            .map_err(|_| anyhow!("connection closed"))?;
+        rx.await.map_err(|_| anyhow!("connection closed"))?
+    }
+
+    pub async fn workspace_job(&self, id: u64) -> Result<Value> {
+        let (reply, rx) = oneshot::channel();
+        self.cmds
+            .send(Command::WorkspaceJob { id, reply })
+            .map_err(|_| anyhow!("connection closed"))?;
+        rx.await.map_err(|_| anyhow!("connection closed"))?
+    }
+
     /// Ask the actor to hang up.
     pub async fn close(&self) {
         let _ = self.cmds.send(Command::Close);
@@ -572,13 +660,22 @@ async fn actor(
     error: Arc<Mutex<Option<String>>>,
     sftp: Arc<AsyncMutex<Option<Arc<SftpSession>>>>,
     tunnels: Arc<Mutex<Vec<Tunnel>>>,
+    remote_targets: RemoteTargets,
+    workspace: Arc<Mutex<Option<WorkspaceInfo>>>,
+    workspace_error: Arc<Mutex<Option<String>>>,
 ) {
+    let mut workspace_service = None;
+    let mut sftp_services: Vec<SftpService> = Vec::new();
+    let mut mounted_paths: Vec<String> = Vec::new();
     loop {
         tokio::select! {
             cmd = rx.recv() => {
                 match cmd {
                     None => break,
                     Some(Command::Close) => {
+                        for path in mounted_paths.iter().rev() {
+                            let _ = run_exec(&mut handle, &unmount_command(path)).await;
+                        }
                         let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
                         break;
                     }
@@ -604,12 +701,136 @@ async fn actor(
                     }
                     Some(Command::StartTunnel { tunnel, reply }) => {
                         let result = match tunnel.kind {
-                            TunnelKind::Remote => handle
-                                .tcpip_forward("0.0.0.0", u32::from(tunnel.listen_port))
-                                .await
-                                .map(|_| ())
-                                .map_err(anyhow::Error::from),
+                            TunnelKind::Remote => {
+                                if tunnel.listen_port == 0 {
+                                    Err(anyhow!("a remote tunnel requires a nonzero listen port"))
+                                } else if remote_targets.lock().unwrap().contains_key(&tunnel.listen_port) {
+                                    Err(anyhow!("remote port is already forwarded"))
+                                } else {
+                                    remote_targets.lock().unwrap().insert(tunnel.listen_port,
+                                        (tunnel.remote_host.clone(), tunnel.remote_port));
+                                    let result = handle.tcpip_forward("127.0.0.1", u32::from(tunnel.listen_port)).await;
+                                    if result.is_err() { remote_targets.lock().unwrap().remove(&tunnel.listen_port); }
+                                    result.map(|_| ()).map_err(anyhow::Error::from)
+                                }
+                            },
                             _ => start_local_listener(&self_tx, &tunnel).await,
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::StartWorkspace { config, reply }) => {
+                        *workspace_error.lock().unwrap() = None;
+                        let result = async {
+                            if workspace_service.is_some() { bail!("this connection already has a shared workspace") }
+                            if !config.enabled { bail!("workspace sharing is disabled") }
+                            if config.remote_port != 0 && remote_targets.lock().unwrap().contains_key(&config.remote_port) {
+                                bail!("workspace remote port is already forwarded");
+                            }
+                            let mut service = WorkspaceService::start(&config).await?;
+                            // Keep a control endpoint for commands typed in the
+                            // server shell, including when real sshfs mounts are
+                            // enabled.
+                            {
+                                let port = handle.tcpip_forward("127.0.0.1", u32::from(config.remote_port))
+                                    .await.context("sshd must allow remote TCP forwarding for workspace sharing")?;
+                                let port = if config.remote_port == 0 { u16::try_from(port)? } else { config.remote_port };
+                                if port == 0 { bail!("sshd did not allocate a workspace port") }
+                                remote_targets.lock().unwrap().insert(port, ("127.0.0.1".into(), service.port));
+                                service.info.url = format!("http://127.0.0.1:{port}");
+                            }
+                            if config.mount {
+                            for (index, mapping) in config.effective_mappings().into_iter().enumerate() {
+                                let sftp = start_sftp_service(
+                                    tokio::fs::canonicalize(&mapping.local_path).await
+                                        .with_context(|| format!("opening local mount {}", mapping.local_path))?,
+                                    config.writable,
+                                ).await?;
+                                let mount_port = handle.tcpip_forward("127.0.0.1", 0).await
+                                    .context("sshd must allow remote forwarding for the SFTP mount")?;
+                                remote_targets.lock().unwrap().insert(
+                                    u16::try_from(mount_port)?,
+                                    ("127.0.0.1".into(), sftp.port),
+                                );
+                                let result = run_exec(&mut handle, &mount_command(mount_port, &mapping.remote_path)).await?;
+                                if !result.ok() {
+                                    // A missing sshfs (or another per-directory mount
+                                    // error) must not turn a usable SSH connection into
+                                    // a failed connection. Remove the forward and retain
+                                    // the diagnostic in the workspace status instead.
+                                    let mount_port = u16::try_from(mount_port)?;
+                                    remote_targets.lock().unwrap().remove(&mount_port);
+                                    let _ = handle
+                                        .cancel_tcpip_forward("127.0.0.1", u32::from(mount_port))
+                                        .await;
+                                    let detail = result.stderr_text().trim().to_string();
+                                    let detail = if detail.is_empty() {
+                                        format!("sshfs mount exited with status {:?}", result.exit)
+                                    } else {
+                                        detail
+                                    };
+                                    if let Some(mount) = service.info.mounts.get_mut(index) {
+                                        mount.mounted = false;
+                                        mount.error = Some(detail);
+                                    }
+                                    continue;
+                                }
+                                if let Some(mount) = service.info.mounts.get_mut(index) {
+                                    mount.mounted = true;
+                                }
+                                mounted_paths.push(mapping.remote_path);
+                                sftp_services.push(sftp);
+                            }
+                            }
+                            let info = service.info.clone();
+                            *workspace.lock().unwrap() = Some(info.clone());
+                            workspace_service = Some(service);
+                            Ok(info)
+                        }.await;
+                        if result.is_err() {
+                            *workspace_error.lock().unwrap() = result.as_ref().err().map(|err| format!("{err:#}"));
+                            for path in mounted_paths.drain(..).rev() {
+                                let _ = run_exec(&mut handle, &unmount_command(&path)).await;
+                            }
+                            sftp_services.clear();
+                        }
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::RunWorkspace { command, cwd, timeout_secs, reply }) => {
+                        let result = match workspace_service.as_ref() {
+                            Some(service) => workspace_request(
+                                service.port,
+                                &service.info.token,
+                                "POST",
+                                "/run",
+                                match serde_json::to_vec(&json!({
+                                    "command": command,
+                                    "cwd": cwd,
+                                    "timeout_secs": timeout_secs,
+                                })) {
+                                    Ok(body) => body,
+                                    Err(err) => {
+                                        let _ = reply.send(Err(err.into()));
+                                        continue;
+                                    }
+                                },
+                            ).await.and_then(|value| {
+                                value.get("id").and_then(Value::as_u64)
+                                    .context("workspace service returned no job id")
+                            }),
+                            None => Err(anyhow!("reverse workspace is not connected")),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    Some(Command::WorkspaceJob { id, reply }) => {
+                        let result = match workspace_service.as_ref() {
+                            Some(service) => workspace_request(
+                                service.port,
+                                &service.info.token,
+                                "GET",
+                                &format!("/jobs/{id}"),
+                                Vec::new(),
+                            ).await,
+                            None => Err(anyhow!("reverse workspace is not connected")),
                         };
                         let _ = reply.send(result);
                     }
@@ -638,7 +859,15 @@ async fn actor(
         }
     }
     alive.store(false, Ordering::SeqCst);
+    for path in mounted_paths.iter().rev() {
+        let _ = run_exec(&mut handle, &unmount_command(path)).await;
+    }
     tunnels.lock().unwrap().clear();
+    remote_targets.lock().unwrap().clear();
+    *workspace.lock().unwrap() = None;
+    *workspace_error.lock().unwrap() = None;
+    drop(workspace_service);
+    drop(sftp_services);
 }
 
 /// Terminal modes advertised with the PTY request.
@@ -738,6 +967,47 @@ async fn run_exec(handle: &mut client::Handle<Handler>, command: &str) -> Result
         }
     }
     Ok(out)
+}
+
+async fn workspace_request(
+    port: u16,
+    token: &str,
+    method: &str,
+    route: &str,
+    body: Vec<u8>,
+) -> Result<Value> {
+    let mut socket = TcpStream::connect(("127.0.0.1", port)).await?;
+    let request = format!(
+        "{method} {route} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(request.as_bytes()).await?;
+    socket.write_all(&body).await?;
+    let mut response = Vec::new();
+    socket.read_to_end(&mut response).await?;
+    let split = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .context("invalid workspace response")?;
+    let header = String::from_utf8_lossy(&response[..split]);
+    let status = header
+        .split_whitespace()
+        .nth(1)
+        .context("workspace response has no status")?;
+    let body = &response[split + 4..];
+    if status != "200" {
+        let error = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned());
+        bail!("workspace request failed ({status}): {error}");
+    }
+    Ok(serde_json::from_slice(body)?)
 }
 
 async fn open_sftp(handle: &mut client::Handle<Handler>) -> Result<Arc<SftpSession>> {

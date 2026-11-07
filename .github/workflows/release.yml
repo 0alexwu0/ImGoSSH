@@ -95,6 +95,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $out | Out-Null
           foreach ($n in 'imgossh','igssh','igscp','igsftp') { Copy-Item "$t/$n.exe" $out }
           Copy-Item LICENSE, README.md $out
+          Copy-Item docs $out -Recurse
           Copy-Item integrations $out -Recurse
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = "${{ runner.temp }}/${{ matrix.artifact }}.zip"
@@ -110,6 +111,7 @@ jobs:
           mkdir -p "$d"
           for n in imgossh igssh igscp igsftp; do cp "target/${{ matrix.target }}/release/$n" "$d/"; done
           cp LICENSE README.md "$d/"
+          cp -R docs "$d/"
           cp -R integrations "$d/"
           tar -C "$(dirname "$d")" -czf "${{ runner.temp }}/${{ matrix.artifact }}.tar.gz" "$(basename "$d")"
           echo "ASSET=${{ runner.temp }}/${{ matrix.artifact }}.tar.gz" >> "$GITHUB_ENV"
@@ -123,6 +125,7 @@ jobs:
           mkdir -p "$d"
           for n in imgossh igssh igscp igsftp; do cp "target/${{ matrix.target }}/release/$n" "$d/"; done
           cp LICENSE README.md "$d/"
+          cp -R docs "$d/"
           cp -R integrations "$d/"
           ditto -c -k --sequesterRsrc "$d" "${{ runner.temp }}/${{ matrix.artifact }}.zip"
           echo "ASSET=${{ runner.temp }}/${{ matrix.artifact }}.zip" >> "$GITHUB_ENV"
