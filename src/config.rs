@@ -359,6 +359,30 @@ impl Palette {
             [0xee, 0xee, 0xec],
         ];
         match name {
+            "Classic" => Palette {
+                foreground: [0xec, 0xec, 0xec],
+                background: [0x1e, 0x1e, 0x1e],
+                cursor: [0xec, 0xec, 0xec],
+                selection: [0x2f, 0x46, 0x5c],
+                ansi: [
+                    [0, 0, 0],
+                    [205, 0, 0],
+                    [96, 255, 96],
+                    [255, 255, 0],
+                    [92, 92, 255],
+                    [255, 0, 255],
+                    [54, 255, 255],
+                    [236, 236, 236],
+                    [127, 127, 127],
+                    [255, 0, 0],
+                    [96, 255, 96],
+                    [255, 255, 0],
+                    [92, 92, 255],
+                    [255, 0, 255],
+                    [54, 255, 255],
+                    [255, 255, 255],
+                ],
+            },
             "Xterm" => Palette {
                 foreground: [0xc0, 0xc0, 0xc0],
                 background: [0x00, 0x00, 0x00],
@@ -458,8 +482,8 @@ impl Palette {
         }
     }
 
-    pub fn names() -> [&'static str; 4] {
-        ["ImGo Dark", "Charcoal", "ImGo Light", "Xterm"]
+    pub fn names() -> [&'static str; 5] {
+        ["ImGo Dark", "Charcoal", "Classic", "ImGo Light", "Xterm"]
     }
 }
 
@@ -529,10 +553,16 @@ impl Default for Config {
             language: "auto".into(),
             theme: Theme::ImGo,
             palette: "ImGo Dark".into(),
-            // Whatever the platform, this is the family whose face covers the
-            // whole terminal grid; a machine without it is detected at startup
-            // and the next complete face takes over.
-            font_family: "Cascadia Mono".into(),
+            // Use the platform's standard monospace face, with grid and CJK
+            // fallbacks installed separately by the terminal renderer.
+            font_family: if cfg!(target_os = "windows") {
+                "Consolas"
+            } else if cfg!(target_os = "macos") {
+                "Menlo"
+            } else {
+                "DejaVu Sans Mono"
+            }
+            .into(),
             font_size: 14.0,
             line_spacing: 1.15,
             scrollback: 5000,

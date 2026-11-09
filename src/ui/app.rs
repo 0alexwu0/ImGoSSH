@@ -1039,6 +1039,10 @@ impl App {
             &self.palette,
             self.store.config.font_size,
         );
+        // The native caption follows the theme too, through DWM rather than
+        // winit or a self-drawn frame.
+        #[cfg(target_os = "windows")]
+        super::windows_caption::follow(ctx, &theme::tokens(self.store.config.theme, &self.palette));
     }
 
     fn sync_config(&mut self, ctx: &Context) {

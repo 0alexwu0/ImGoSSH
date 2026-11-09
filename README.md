@@ -54,14 +54,14 @@ SFTP 可以作为独立标签页打开，也可以停靠在终端右侧。双栏
 
 ## 下载
 
-最新版本：[v0.3.2](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.2)
+最新版本：[v0.3.3](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.3)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
 每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md`、使用文档、JumpServer 连接器和反向工作区辅助脚本。Release 页面同时提供 SHA-256 校验值。
 
@@ -70,6 +70,15 @@ Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发�
 ```bash
 xattr -dr com.apple.quarantine <解压目录>
 ```
+
+## v0.3.3 更新
+
+- 新增 Classic 终端配色，提供深灰背景和高饱和的青色、绿色、黄色。
+- 默认使用系统等宽字体，保留框线、方块和中文字符的字体回退。
+- 修正 ANSI 反色时默认前景、背景及粗体颜色的解析，改善终端菜单和表头的可读性。
+- 原生 Windows 标题栏随主题变化：Win11 使用主题颜色，Win10 使用系统深色或浅色标题栏。
+
+详细说明见 [v0.3.3 发布说明](docs/release-0.3.3.md)。Win10 的标题栏绘制、输入和高 DPI 表现仍需实机确认。
 
 ## v0.3.2 更新
 
@@ -187,9 +196,9 @@ igworkspace cancel 1
 
 ### 外观与更新
 
-支持简体中文和英文界面，语言默认跟随系统。设置中可切换 ImGo、Dark、Light 三套界面主题，以及 ImGo Dark、Charcoal、ImGo Light、Xterm 四套终端调色板，调整字体、字号、行距和回滚行数。终端内置 Hack 字体，并为框线、方块等字符提供字体回退。
+支持简体中文和英文界面，语言默认跟随系统。设置中可切换 ImGo、Dark、Light 三套界面主题，以及 ImGo Dark、Charcoal、Classic、ImGo Light、Xterm 五套终端调色板，调整字体、字号、行距和回滚行数。Classic 提供深灰底色和高饱和的 ANSI 颜色。终端默认使用系统等宽字体，内置 Hack 作为回退，并为框线、方块等字符提供字体回退。
 
-Windows 使用系统原生标题栏，应用主题不会同步修改原生窗口主题。Win10 启动时额外清除窗口库自动套用的深色样式，使用标准浅色原生标题栏，针对点击标题栏后标题文字和按钮绘制异常的问题；Win11 保留系统默认标题栏。应用内的界面主题和终端配色可独立设置。
+Windows 使用系统原生标题栏，标题栏颜色跟随应用主题：Win11 通过 DWM 将标题栏底色、标题文字和边框设为当前主题的颜色；Win10 不支持自定义标题栏颜色，ImGo、Dark 主题使用系统深色标题栏，Light 主题使用标准浅色标题栏。窗口库自带的深色样式（DarkMode_Explorer）始终关闭，避免点击标题栏后标题文字和按钮绘制异常；切换主题时只更新标题栏颜色，不移动、缩放或重绘窗口框架以外的内容。应用内的界面主题和终端配色可独立设置。
 
 「帮助 → 检查更新」可以手动检查 GitHub Releases。自动检查默认开启，成功检查后的间隔为 6 小时，可在设置中关闭；发现更新后由用户确认下载和安装，完成后重启生效。
 

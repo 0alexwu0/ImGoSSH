@@ -153,9 +153,9 @@ pub fn tokens(theme: Theme, palette: &Palette) -> Tokens {
 /// Dress the context with a theme. Idempotent: every field is written from
 /// scratch, so switching themes never leaves paint from the previous one.
 pub fn apply(ctx: &Context, theme: Theme, palette: &Palette, mono: f32) {
-    // Keep the native Windows caption under the system's control. egui's
-    // default theme sync calls winit's DarkMode_Explorer override, which can
-    // leave Win10 caption text and buttons unreadable after activation.
+    // egui's default theme sync calls winit's DarkMode_Explorer override,
+    // which can leave Win10 caption text and buttons unreadable after
+    // activation. `ui::windows_caption` colours the caption through DWM instead.
     #[cfg(target_os = "windows")]
     ctx.options_mut(|options| options.sync_window_theme = false);
 

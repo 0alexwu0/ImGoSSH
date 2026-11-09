@@ -649,14 +649,14 @@ fn run_style(
     row: u16,
     col: u16,
 ) -> Run {
-    let (fg_raw, bg_raw) = if c.inverse() {
-        (c.bgcolor(), c.fgcolor())
-    } else {
-        (c.fgcolor(), c.bgcolor())
-    };
+    // Resolve defaults and bold against their original roles before swapping:
+    // inverse default ink must become the default ground, not light ink again.
+    let fg = resolve(c.fgcolor(), palette, true, c.bold());
+    let bg = resolve(c.bgcolor(), palette, false, false);
+    let (fg, bg) = if c.inverse() { (bg, fg) } else { (fg, bg) };
     Run {
-        fg: resolve(fg_raw, palette, true, c.bold()),
-        bg: resolve(bg_raw, palette, false, false),
+        fg,
+        bg,
         bold: c.bold(),
         italic: c.italic(),
         dim: c.dim(),
@@ -1400,6 +1400,25 @@ pub const RELEASE: u16 = MOUSE_RELEASE;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inverse_colours_swap_resolved_defaults_and_preserve_background_intensity() {
+        let palette = Palette::preset("Classic");
+        let mut parser = vt100::Parser::new(1, 8, 0);
+        parser.process(b"\x1b[36;7mA\x1b[0;1;32;7mB\x1b[0;1;46;7mC\x1b[0;7mD");
+        let screen = parser.screen();
+        let runs: Vec<_> = (0..4)
+            .map(|col| run_style(screen.cell(0, col).unwrap(), &palette, None, 0, col))
+            .collect();
+        assert_eq!(runs[0].fg, rgb(palette.background));
+        assert_eq!(runs[0].bg, rgb(palette.ansi[6]));
+        assert_eq!(runs[1].fg, rgb(palette.background));
+        assert_eq!(runs[1].bg, rgb(palette.ansi[10]));
+        assert_eq!(runs[2].fg, rgb(palette.ansi[6]));
+        assert_eq!(runs[2].bg, rgb(palette.foreground));
+        assert_eq!(runs[3].fg, rgb(palette.background));
+        assert_eq!(runs[3].bg, rgb(palette.foreground));
+    }
 
     fn key(key: egui::Key) -> egui::Event {
         egui::Event::Key {
