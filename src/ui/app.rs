@@ -613,6 +613,9 @@ impl App {
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            tab.view.want_focus = true;
+        }
     }
 }
 
@@ -1086,10 +1089,8 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ctx = Some(ctx.clone());
         self.apply_theme(ctx);
-        // The title bar is painted by the operating system, which keeps its own
-        // idea of dark and light unless it is told: that is how a dark interface
-        // ends up wearing a white caption. The panels sit on `surface` and the
-        // title reads in `text`, so the frame is those two colours and no other.
+        // Match the native caption to the panels, or draw it ourselves when
+        // the compositor cannot set its colours (Windows 10).
         let tokens = theme::tokens(self.store.config.theme, &self.palette);
         self.chrome.follow(
             ctx,
@@ -1150,6 +1151,15 @@ impl eframe::App for App {
             tab.monitor.set_paused(idle);
         }
 
+        let tokens = theme::tokens(self.store.config.theme, &self.palette);
+        self.chrome.show(
+            ui,
+            chrome::Want {
+                caption: tokens.surface,
+                text: tokens.text,
+                dark: tokens.dark,
+            },
+        );
         self.menu_bar(ui);
         if self.store.config.show_toolbar {
             self.tool_bar(ui);
@@ -1202,6 +1212,7 @@ impl eframe::App for App {
             });
 
         self.dialogs(&ctx);
+        self.chrome.resize_frame(ui);
     }
 
     fn on_exit(&mut self) {
@@ -1492,7 +1503,7 @@ impl App {
             return;
         }
         let count = self.tabs.len() as isize;
-        self.active = (self.active as isize + delta).rem_euclid(count) as usize;
+        self.goto_tab((self.active as isize + delta).rem_euclid(count) as usize);
     }
 
     fn toggle_browser(&mut self) {
@@ -1557,6 +1568,7 @@ impl App {
     fn goto_tab(&mut self, index: usize) {
         if index < self.tabs.len() {
             self.active = index;
+            self.tabs[index].view.want_focus = true;
         }
     }
 
@@ -2038,7 +2050,7 @@ impl App {
             return;
         }
         if let Some(index) = select {
-            self.active = index;
+            self.goto_tab(index);
         }
         if let Some(index) = rename {
             if let Some(tab) = self.tabs.get_mut(index) {
@@ -2201,15 +2213,20 @@ impl App {
         let local = self.tabs[index].session.protocol == Protocol::Local;
         let notice = closed_notice(ui, &status, local);
         let tab = &mut self.tabs[index];
-        let out = term_widget::show(
-            ui,
-            &tab.emu,
-            &tab.backend,
-            &mut tab.view,
-            &style,
-            menu_open,
-            notice.as_ref(),
-        );
+        // Each shell owns its focus/IME identity even when tabs share a pane.
+        let out = ui
+            .push_id(Arc::as_ptr(&tab.emu), |ui| {
+                term_widget::show(
+                    ui,
+                    &tab.emu,
+                    &tab.backend,
+                    &mut tab.view,
+                    &style,
+                    menu_open,
+                    notice.as_ref(),
+                )
+            })
+            .inner;
 
         if let Some((rows, cols)) = out.resized {
             if let Some(backend) = tab.backend.lock().unwrap().as_ref() {

@@ -181,6 +181,12 @@ pub struct TerminalHandle {
 }
 
 impl TerminalHandle {
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (Self, mpsc::UnboundedReceiver<TermInput>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self { tx }, rx)
+    }
+
     /// Write raw bytes to the remote PTY.
     pub fn send(&self, bytes: Vec<u8>) -> Result<()> {
         self.tx

@@ -1,10 +1,5 @@
-//! The window frame the operating system paints: the bar the title lives in.
-//!
-//! egui draws everything below the caption and nothing above it, so the strip
-//! handed to us by the window manager is the one part of the interface these
-//! themes cannot reach by drawing. Left alone it keeps a frame of its own about
-//! dark and light - and turns white in the middle of a dark window - so it is
-//! told what the panels were painted with whenever that moves.
+//! Keep the native caption in theme, with an application-drawn fallback when
+//! the compositor cannot set its colours (including Windows 10).
 
 use egui::Color32;
 
@@ -21,8 +16,8 @@ pub struct Want {
 
 /// Native theme changes can finish after the first egui frame. Reapply for a
 /// bounded startup interval and whenever focus returns, without polling at idle.
-#[derive(Default)]
 pub struct Chrome {
+    custom: bool,
     desired: Option<Want>,
     applied: Option<Want>,
     focused: bool,
@@ -30,11 +25,81 @@ pub struct Chrome {
     next_attempt: Option<std::time::Instant>,
 }
 
+impl Default for Chrome {
+    fn default() -> Self {
+        Self {
+            custom: startup_custom_caption(),
+            desired: None,
+            applied: None,
+            focused: false,
+            attempts_left: 0,
+            next_attempt: None,
+        }
+    }
+}
+
+/// Decide before creating the HWND, so Win10 never shows a native white caption
+/// while waiting for the runtime colour retries. Share the choice with Chrome.
+pub fn startup_viewport(viewport: egui::ViewportBuilder) -> egui::ViewportBuilder {
+    configure_viewport(viewport, startup_custom_caption())
+}
+
+fn configure_viewport(viewport: egui::ViewportBuilder, custom: bool) -> egui::ViewportBuilder {
+    if custom {
+        viewport.with_decorations(false)
+    } else {
+        viewport
+    }
+}
+
+fn startup_custom_caption() -> bool {
+    #[cfg(windows)]
+    {
+        static CUSTOM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CUSTOM.get_or_init(|| {
+            use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+            // GetVersionEx depends on the executable's compatibility manifest.
+            // RtlGetVersion reports the actual build (Win11 starts at 22000).
+            #[link(name = "ntdll")]
+            unsafe extern "system" {
+                fn RtlGetVersion(version: *mut OSVERSIONINFOW) -> i32;
+            }
+            let mut version = OSVERSIONINFOW {
+                dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+                ..Default::default()
+            };
+            let succeeded = unsafe { RtlGetVersion(&mut version) } >= 0;
+            needs_custom_caption(
+                succeeded.then_some((version.dwMajorVersion, version.dwBuildNumber)),
+            )
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(any(windows, test))]
+fn needs_custom_caption(version: Option<(u32, u32)>) -> bool {
+    !matches!(version, Some((major, build)) if major > 10 || (major == 10 && build >= 22000))
+}
+
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const ATTEMPTS: u8 = 5;
 
 impl Chrome {
     pub fn follow(&mut self, ctx: &egui::Context, want: Want) {
+        self.follow_with(ctx, want, std::time::Instant::now(), apply);
+    }
+
+    fn follow_with(
+        &mut self,
+        ctx: &egui::Context,
+        want: Want,
+        now: std::time::Instant,
+        apply: impl FnMut(Want) -> bool,
+    ) {
         if self.desired != Some(want) {
             // Set winit's preferred theme too, so later system theme messages
             // cannot undo the application theme on Windows 10.
@@ -45,8 +110,177 @@ impl Chrome {
             }));
         }
         let focused = ctx.input(|input| input.viewport().focused.unwrap_or(false));
-        if let Some(delay) = self.update(want, focused, std::time::Instant::now(), apply) {
+        if self.custom {
+            self.desired = Some(want);
+            return;
+        }
+        if let Some(delay) = self.update(want, focused, now, apply) {
             ctx.request_repaint_after(delay);
+        }
+        // Win10 cannot set an exact caption colour. A successful dark-mode
+        // attribute alone does not mean the frame follows the application.
+        if cfg!(windows) && self.attempts_left == 0 && self.applied != Some(want) {
+            self.custom = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(false));
+            ctx.request_repaint();
+        }
+    }
+
+    /// Draw the caption when the native compositor cannot use our colours.
+    pub fn show(&self, ui: &mut egui::Ui, want: Want) {
+        if !self.custom || ui.input(|i| i.viewport().fullscreen == Some(true)) {
+            return;
+        }
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+        egui::Panel::top("application-caption")
+            .exact_size(32.0)
+            .show_separator_line(false)
+            .frame(egui::Frame::new().fill(want.caption))
+            .show(ui, |ui| {
+                let rect = ui.max_rect();
+                let buttons_left = rect.right() - 3.0 * 46.0;
+                let drag_rect =
+                    egui::Rect::from_min_max(rect.min, egui::pos2(buttons_left, rect.bottom()));
+                let response = ui.interact(
+                    drag_rect,
+                    ui.id().with("drag"),
+                    egui::Sense::click_and_drag(),
+                );
+                if response.double_clicked() {
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                } else if response.drag_started_by(egui::PointerButton::Primary) {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                }
+                let mut logo =
+                    ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+                        rect.min + egui::vec2(8.0, 7.0),
+                        egui::vec2(18.0, 18.0),
+                    )));
+                super::theme::logo(&mut logo, 18.0);
+                let title = ui.input(|i| i.viewport().title.clone()).unwrap_or_else(|| {
+                    format!("{} {}", crate::config::APP_NAME, crate::config::APP_VERSION)
+                });
+                ui.painter().with_clip_rect(drag_rect).text(
+                    rect.min + egui::vec2(34.0, 16.0),
+                    egui::Align2::LEFT_CENTER,
+                    title,
+                    egui::FontId::proportional(12.0),
+                    want.text,
+                );
+                for (index, label, command) in [
+                    (
+                        0,
+                        crate::t!("Minimize"),
+                        egui::ViewportCommand::Minimized(true),
+                    ),
+                    (
+                        1,
+                        if maximized {
+                            crate::t!("Restore")
+                        } else {
+                            crate::t!("Maximize")
+                        },
+                        egui::ViewportCommand::Maximized(!maximized),
+                    ),
+                    (2, crate::t!("Close"), egui::ViewportCommand::Close),
+                ] {
+                    let button = egui::Rect::from_min_size(
+                        egui::pos2(buttons_left + index as f32 * 46.0, rect.top()),
+                        egui::vec2(46.0, 32.0),
+                    );
+                    let response = ui.interact(button, ui.id().with(index), egui::Sense::click());
+                    let mut color = want.text;
+                    if response.hovered() {
+                        let fill = if index == 2 {
+                            color = Color32::WHITE;
+                            Color32::from_rgb(196, 43, 28)
+                        } else {
+                            ui.visuals().widgets.hovered.bg_fill
+                        };
+                        ui.painter().rect_filled(button, 0.0, fill);
+                    }
+                    let centre = button.center();
+                    let icon = egui::Rect::from_center_size(centre, egui::vec2(10.0, 10.0));
+                    let stroke = egui::Stroke::new(1.0, color);
+                    match index {
+                        0 => {
+                            ui.painter().hline(icon.x_range(), centre.y, stroke);
+                        }
+                        1 => {
+                            if maximized {
+                                ui.painter().rect_stroke(
+                                    icon.translate(egui::vec2(2.0, -2.0)),
+                                    0.0,
+                                    stroke,
+                                    egui::StrokeKind::Inside,
+                                );
+                            }
+                            ui.painter()
+                                .rect_stroke(icon, 0.0, stroke, egui::StrokeKind::Inside);
+                        }
+                        _ => {
+                            ui.painter()
+                                .line_segment([icon.left_top(), icon.right_bottom()], stroke);
+                            ui.painter()
+                                .line_segment([icon.right_top(), icon.left_bottom()], stroke);
+                        }
+                    }
+                    if response.clicked() {
+                        ui.ctx().send_viewport_cmd(command);
+                    }
+                    response.on_hover_text(label);
+                }
+            });
+    }
+
+    /// Borderless windows need explicit resize handles, including all corners.
+    pub fn resize_frame(&self, ui: &egui::Ui) {
+        if !self.custom
+            || ui.input(|i| {
+                i.viewport().maximized == Some(true) || i.viewport().fullscreen == Some(true)
+            })
+        {
+            return;
+        }
+        let rect = ui.ctx().viewport_rect();
+        let edge = 5.0;
+        use egui::{CursorIcon as C, ResizeDirection as D};
+        for (index, (x, y, direction, cursor)) in [
+            (0, 0, D::NorthWest, C::ResizeNwSe),
+            (1, 0, D::North, C::ResizeVertical),
+            (2, 0, D::NorthEast, C::ResizeNeSw),
+            (0, 1, D::West, C::ResizeHorizontal),
+            (2, 1, D::East, C::ResizeHorizontal),
+            (0, 2, D::SouthWest, C::ResizeNeSw),
+            (1, 2, D::South, C::ResizeVertical),
+            (2, 2, D::SouthEast, C::ResizeNwSe),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let axis = |min: f32, max: f32, part| match part {
+                0 => (min, min + edge),
+                1 => (min + edge, max - edge),
+                _ => (max - edge, max),
+            };
+            let (left, right) = axis(rect.left(), rect.right(), x);
+            let (top, bottom) = axis(rect.top(), rect.bottom(), y);
+            egui::Area::new(egui::Id::new(("frame-resize", index)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(left, top))
+                .movable(false)
+                .show(ui.ctx(), |ui| {
+                    let (_, response) = ui.allocate_exact_size(
+                        egui::vec2(right - left, bottom - top),
+                        egui::Sense::drag(),
+                    );
+                    if response.drag_started_by(egui::PointerButton::Primary) {
+                        ui.ctx()
+                            .send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                    }
+                    response.on_hover_cursor(cursor);
+                });
         }
     }
 
@@ -78,7 +312,7 @@ impl Chrome {
         self.attempts_left -= 1;
         if self.attempts_left == 0 && self.applied != Some(want) {
             log::warn!(
-                "Native title bar theme could not be applied; will retry when focus returns"
+                "Native title bar colours unavailable; using an application-drawn title bar on Windows"
             );
         }
         self.next_attempt = (self.attempts_left > 0).then_some(now + RETRY_DELAY);
@@ -89,7 +323,7 @@ impl Chrome {
 /// Paint every window of ours that has a title bar.
 ///
 /// `true` when visible captioned windows were found and accepted dark mode
-/// and the frame refresh. Win11-only colour attributes are optional on Win10.
+/// and the exact caption colours. Otherwise use the application-drawn frame.
 #[cfg(windows)]
 fn apply(want: Want) -> bool {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, TRUE};
@@ -136,11 +370,11 @@ fn apply(want: Want) -> bool {
         let dark = i32::from(walk.want.dark);
         let caption = colorref(walk.want.caption);
         let text = colorref(walk.want.text);
-        // Windows 10 before build 18985 uses attribute 19. Explicit caption,
-        // text and border colours are Windows 11 additions and remain optional.
+        // Windows 10 before build 18985 uses attribute 19. Explicit caption
+        // and text colours require Windows 11; failure selects the custom frame.
         let dark_applied = set_dark_attribute(|attribute| set(hwnd, attribute, &dark));
-        set(hwnd, DWMWA_CAPTION_COLOR as u32, &caption);
-        set(hwnd, DWMWA_TEXT_COLOR as u32, &text);
+        let caption_applied = set(hwnd, DWMWA_CAPTION_COLOR as u32, &caption);
+        let text_applied = set(hwnd, DWMWA_TEXT_COLOR as u32, &text);
         set(hwnd, DWMWA_BORDER_COLOR as u32, &caption);
         // Recalculate the non-client frame without moving, resizing or focusing
         // the window. Win10 may otherwise keep the previous caption cached.
@@ -154,7 +388,7 @@ fn apply(want: Want) -> bool {
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         ) != 0;
         walk.found = true;
-        walk.success &= dark_applied && refreshed;
+        walk.success &= dark_applied && caption_applied && text_applied && refreshed;
         1
     }
 
@@ -202,6 +436,222 @@ fn apply(_want: Want) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn win10_starts_with_the_themed_caption_without_runtime_replacement() {
+        for (version, custom) in [
+            (Some((10, 17763)), true),
+            (Some((10, 19045)), true),
+            (Some((10, 21999)), true),
+            (Some((10, 22000)), false),
+            (Some((10, 26100)), false),
+            (Some((11, 0)), false),
+            (None, true),
+        ] {
+            assert_eq!(needs_custom_caption(version), custom);
+            let viewport = configure_viewport(egui::ViewportBuilder::default(), custom);
+            assert_eq!(
+                viewport.decorations,
+                if custom { Some(false) } else { None }
+            );
+            if !custom {
+                continue;
+            }
+            let ctx = egui::Context::default();
+            let mut chrome = Chrome {
+                custom,
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                chrome.follow_with(ui.ctx(), want(), std::time::Instant::now(), |_| {
+                    panic!("Win10 must not wait for DWM retries")
+                });
+                chrome.show(ui, want());
+            });
+            output.textures_delta.clear();
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Rect(rect) if rect.fill == want().caption && rect.rect.height() == 32.0)));
+            assert!(!output.viewport_output[&egui::ViewportId::ROOT]
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Decorations(_))));
+            assert_eq!(chrome.attempts_left, 0);
+        }
+        assert_eq!(
+            Chrome::default().custom,
+            startup_viewport(egui::ViewportBuilder::default()).decorations == Some(false)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unavailable_caption_colours_switch_to_custom_frame() {
+        for supported in [false, true] {
+            let ctx = egui::Context::default();
+            let mut chrome = Chrome {
+                custom: false,
+                ..Default::default()
+            };
+            let start = std::time::Instant::now();
+            for step in 0..ATTEMPTS {
+                ctx.begin_pass(egui::RawInput::default());
+                chrome.follow_with(&ctx, want(), start + RETRY_DELAY * u32::from(step), |_| {
+                    supported
+                });
+                let mut output = ctx.end_pass();
+                output.textures_delta.clear();
+                let hides_frame = output.viewport_output[&egui::ViewportId::ROOT]
+                    .commands
+                    .contains(&egui::ViewportCommand::Decorations(false));
+                assert_eq!(hides_frame, !supported && step == ATTEMPTS - 1);
+            }
+            assert_eq!(chrome.custom, !supported);
+            if chrome.custom {
+                ctx.begin_pass(egui::RawInput::default());
+                let light = Want {
+                    caption: Color32::WHITE,
+                    text: Color32::BLACK,
+                    dark: false,
+                };
+                chrome.follow_with(&ctx, light, start + RETRY_DELAY * 10, |_| {
+                    panic!("custom frame called DWM")
+                });
+                assert_eq!(chrome.desired, Some(light));
+                ctx.end_pass().textures_delta.clear();
+            }
+        }
+    }
+
+    fn caption_frame(
+        ctx: &egui::Context,
+        want: Want,
+        maximized: bool,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 450.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        raw.viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .unwrap()
+            .maximized = Some(maximized);
+        let chrome = Chrome {
+            custom: true,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(raw, |ui| {
+            chrome.show(ui, want);
+            chrome.resize_frame(ui);
+        });
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn custom_caption_tracks_colours_and_window_buttons() {
+        for want in [
+            want(),
+            Want {
+                caption: Color32::WHITE,
+                text: Color32::BLACK,
+                dark: false,
+            },
+        ] {
+            let ctx = egui::Context::default();
+            let output = caption_frame(&ctx, want, false, vec![]);
+            assert!(output.shapes.iter().any(|clipped| matches!(&clipped.shape,
+                egui::Shape::Rect(rect) if rect.fill == want.caption && rect.rect.height() == 32.0)));
+            for (index, maximized, expected) in [
+                (0, false, egui::ViewportCommand::Minimized(true)),
+                (1, false, egui::ViewportCommand::Maximized(true)),
+                (1, true, egui::ViewportCommand::Maximized(false)),
+                (2, false, egui::ViewportCommand::Close),
+            ] {
+                let ctx = egui::Context::default();
+                caption_frame(&ctx, want, maximized, vec![]);
+                let pos = egui::pos2(800.0 - 138.0 + index as f32 * 46.0 + 23.0, 16.0);
+                for pressed in [true, false] {
+                    let output = caption_frame(
+                        &ctx,
+                        want,
+                        maximized,
+                        vec![
+                            egui::Event::PointerMoved(pos),
+                            egui::Event::PointerButton {
+                                pos,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::default(),
+                            },
+                        ],
+                    );
+                    if !pressed {
+                        assert!(
+                            output.viewport_output[&egui::ViewportId::ROOT]
+                                .commands
+                                .contains(&expected),
+                            "caption button did not send {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn custom_frame_can_drag_and_resize_from_its_edges() {
+        for (start, end, expected) in [
+            (
+                egui::pos2(200.0, 16.0),
+                egui::pos2(220.0, 16.0),
+                egui::ViewportCommand::StartDrag,
+            ),
+            (
+                egui::pos2(2.0, 200.0),
+                egui::pos2(20.0, 200.0),
+                egui::ViewportCommand::BeginResize(egui::ResizeDirection::West),
+            ),
+            (
+                egui::pos2(798.0, 448.0),
+                egui::pos2(780.0, 430.0),
+                egui::ViewportCommand::BeginResize(egui::ResizeDirection::SouthEast),
+            ),
+        ] {
+            let ctx = egui::Context::default();
+            for _ in 0..2 {
+                caption_frame(&ctx, want(), false, vec![]);
+            }
+            let mut commands = Vec::new();
+            for events in [
+                vec![
+                    egui::Event::PointerMoved(start),
+                    egui::Event::PointerButton {
+                        pos: start,
+                        button: egui::PointerButton::Primary,
+                        pressed: true,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ],
+                vec![egui::Event::PointerMoved(end)],
+            ] {
+                let output = caption_frame(&ctx, want(), false, events);
+                commands.extend(
+                    output.viewport_output[&egui::ViewportId::ROOT]
+                        .commands
+                        .clone(),
+                );
+            }
+            assert!(
+                commands.contains(&expected),
+                "frame did not send {expected:?}: {commands:?}"
+            );
+        }
+    }
 
     /// The byte order is the classic mistake, and it stays invisible until a
     /// blue interface turns orange.

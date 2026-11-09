@@ -7,7 +7,15 @@
 
 **ImGoSSH 是一个用 Rust 编写的原生 SSH / SFTP / SCP 工作站。**
 
-它把多标签终端、会话管理、SFTP 文件浏览器、传输队列、SSH 隧道和反向工作区放在一个桌面应用里，同时提供三个 OpenSSH 风格的命令行工具。反向工作区可以让服务器访问客户端指定目录，并将代码交给客户端电脑运行、返回日志和退出码。
+在一个窗口里连接服务器、查看日志、管理文件和运行任务。ImGoSSH 集成多标签终端、会话管理、SFTP 文件浏览器、传输队列、SSH 隧道和反向工作区，同时提供三个 OpenSSH 风格的命令行工具。
+
+| 工作场景 | 功能 |
+| --- | --- |
+| 连接与排障 | SSH / 本地终端、多标签切换、会话分组与搜索、中英文混排和彩色日志 |
+| 部署与文件管理 | 远程 / 本地双栏 SFTP、文件夹递归上传下载、逐文件进度和取消、远程权限编辑 |
+| 服务器调用本机资源 | 多目录反向工作区、Linux sshfs 挂载、本机任务执行、日志与退出码 |
+| 连接基础设施 | 本地 / 远程 / SOCKS5 隧道、JumpServer SSH / SFTP 接入、服务器状态监控 |
+| 日常使用 | 中英文界面、三套界面主题、四套终端配色、可选会话文件加密、内置更新 |
 
 包含以下程序：
 
@@ -16,22 +24,44 @@
 - `igscp`：本地与远程之间的文件复制
 - `igsftp`：交互式 SFTP 命令行
 
-![ImGoSSH GUI](docs/gui.png)
+![ImGoSSH：多标签 SSH 终端、SFTP 侧栏、会话分组与服务器状态](docs/gui.png)
+
+*功能界面：左侧管理会话，中间查看中英文彩色日志，右侧浏览 SFTP 文件，底部显示服务器状态。截图使用本地演示 SSH / SFTP 服务，日志、文件和监控指标均为示例数据。*
 
 GUI 与 CLI 共用 `src/ssh`、`src/terminal` 和配置代码。连接、认证、主机密钥和文件传输因此保持一致。
 
-[下载](#下载) · [开始使用](#开始使用) · [反向工作区](#反向工作区) · [GUI 功能](#gui-功能) · [命令行工具](#命令行工具) · [源码构建](#从源码构建) · [配置](#配置与数据) · [开发与测试](#测试)
+[下载](#下载) · [功能截图](#功能截图) · [开始使用](#开始使用) · [反向工作区](#反向工作区) · [GUI 功能](#gui-功能) · [命令行工具](#命令行工具) · [源码构建](#从源码构建) · [配置](#配置与数据) · [开发与测试](#测试)
+
+## 功能截图
+
+### 远程与本地双栏文件管理
+
+SFTP 可以作为独立标签页打开，也可以停靠在终端右侧。双栏界面用于浏览远程与本地目录，支持上传、下载、拖放、目录操作及文件属性查看。
+
+![SFTP 独立标签页：远程与本地目录、文件大小及修改时间](docs/screenshots/sftp.png)
+
+### 多目录反向工作区
+
+为每个客户端目录设置服务器路径，并分别控制文件修改和本机程序执行权限。启用挂载需要服务器具备 sshfs/FUSE；连接后可通过 GUI 或服务器端 `igworkspace` 提交本机任务、查看日志并取消任务。
+
+![反向工作区配置：多个目录映射、挂载选项、文件修改与本机执行权限](docs/screenshots/workspace.png)
+
+### 界面主题与终端配色
+
+界面主题和终端调色板可以独立选择，字号、行距和回滚行数可调整。下图展示 Light 界面主题与 ImGo Light 终端配色。
+
+![外观设置：中英文界面、字号、行距、回滚行数、主题与终端调色板](docs/screenshots/appearance.png)
 
 ## 下载
 
-最新版本：[v0.2.3](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.2.3)
+最新版本：[v0.3.1](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.1)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.2.3/ImGoSSH-0.2.3-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
 每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md`、使用文档、JumpServer 连接器和反向工作区辅助脚本。Release 页面同时提供 SHA-256 校验值。
 
@@ -40,6 +70,16 @@ Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发�
 ```bash
 xattr -dr com.apple.quarantine <解压目录>
 ```
+
+## v0.3.1 更新
+
+- SSH shell 就绪后自动聚焦终端，切换标签页后可直接输入。
+- 支持中文、日文、韩文等输入法预编辑和 UTF-8 输入，候选窗口跟随终端光标，选字回车不会误执行远端命令。
+- 统一主字体与中文回退字体的文字基线，修正中英文混排时上下错位。
+- Win10 在创建窗口时直接使用跟随软件主题的标题栏，修正启动时白色标题栏闪烁；保留拖动、窗口按钮及边缘缩放。
+- 更新 README 与功能截图，展示 SSH、SFTP 双栏文件管理、反向工作区和外观设置。
+
+详细说明见 [v0.3.1 发布说明](docs/release-0.3.1.md)。截图拍摄版本与演示数据说明见 [截图说明](docs/screenshots/README.md)。
 
 ## v0.2.3 更新
 
@@ -92,6 +132,7 @@ JumpServer 桌面客户端，备份并写入配置。两项均已配置时不关
 - 鼠标拖动选中文字时实时显示选区，支持反向拖选和跨行选择。
 - 终端右键菜单在窗口边缘自动调整位置，不会被底部或右侧裁切。
 - 支持 16 色、256 色、24 位真彩色、VT/ANSI 查询、OSC 颜色设置和 DEC 特殊图形字符集。
+- 中文回退字体与英文使用统一基线，中文保持双列占位，混排日志和后续列位置保持对齐。
 
 ### SFTP 文件浏览器
 
@@ -140,6 +181,8 @@ igworkspace cancel 1
 ### 外观与更新
 
 支持简体中文和英文界面，语言默认跟随系统。设置中可切换 ImGo、Dark、Light 三套界面主题，以及 ImGo Dark、Charcoal、ImGo Light、Xterm 四套终端调色板，调整字体、字号、行距和回滚行数。终端内置 Hack 字体，并为框线、方块等字符提供字体回退。
+
+Windows 标题栏跟随界面主题：Win11 使用系统标题栏配色，Win10 从窗口创建起使用软件绘制的主题标题栏，支持拖动、双击最大化、边缘缩放和最小化 / 最大化 / 关闭按钮。
 
 「帮助 → 检查更新」可以手动检查 GitHub Releases。自动检查默认开启，成功检查后的间隔为 6 小时，可在设置中关闭；发现更新后由用户确认下载和安装，完成后重启生效。
 

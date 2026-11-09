@@ -76,9 +76,18 @@ pub struct State {
     /// Ask the grid for the keyboard as soon as it is drawn again, used to
     /// hand focus back after the right-click menu ate the click.
     pub want_focus: bool,
+    /// Focus once the shell, rather than just authentication, is ready.
+    connected_focus: bool,
+    ime: Composition,
     /// Expected glyph advances, kept so that every cell can be dropped back
     /// onto its own column.
     guesses: Guesses,
+}
+
+#[derive(Default)]
+struct Composition {
+    text: String,
+    active_range: Option<std::ops::Range<usize>>,
 }
 
 /// Colours and metrics for one frame.
@@ -425,6 +434,45 @@ fn close_group(
     jobs[the_job(!fills)].append("", allotted, format.clone());
 }
 
+/// egui centres fallback faces within the primary face's line box. A terminal
+/// instead needs one baseline, even when Chinese or emoji come from another
+/// face. Move both the glyph positions and their already tessellated vertices;
+/// changing only the positions would leave the painted text where it was.
+/// Keep egui's cached galley untouched, and avoid a copy for aligned Latin rows.
+fn align_baseline(galley: &mut Arc<egui::Galley>, baseline: f32) {
+    if galley.rows.iter().all(|row| {
+        row.glyphs
+            .iter()
+            .all(|glyph| (glyph.pos.y - baseline).abs() < 0.001)
+    }) {
+        return;
+    }
+    let galley = Arc::make_mut(galley);
+    galley.mesh_bounds = Rect::NOTHING;
+    for placed in &mut galley.rows {
+        let row = Arc::make_mut(&mut placed.row);
+        for index in 0..row.glyphs.len() {
+            let glyph = row.glyphs[index];
+            let shift = baseline - glyph.pos.y;
+            let start = glyph.first_vertex as usize;
+            // Whitespace has no vertices; its range ends at the next glyph's
+            // start just like any other glyph. Decorations are painted apart.
+            let end = row
+                .glyphs
+                .get(index + 1)
+                .map_or(row.visuals.glyph_vertex_range.end, |next| {
+                    next.first_vertex as usize
+                });
+            for vertex in &mut row.visuals.mesh.vertices[start..end] {
+                vertex.pos.y += shift;
+            }
+            row.glyphs[index].pos.y = baseline;
+        }
+        row.visuals.mesh_bounds = row.visuals.mesh.calc_bounds();
+        galley.mesh_bounds |= row.visuals.mesh_bounds.translate(placed.pos.to_vec2());
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint(
     painter: &Painter,
@@ -550,7 +598,10 @@ fn paint(
             // edge of the row the run is measured from: a run of nothing but
             // upper halves has no bottom edge to aim at.
             let on_the_floor = job.text.chars().any(|ch| !hangs_from_the_ceiling(ch));
-            let galley = painter.layout_job(job);
+            let mut galley = painter.layout_job(job);
+            if !fills {
+                align_baseline(&mut galley, style.grid.baseline - inset);
+            }
             // The glyphs that fill a cell are measured against the cell rather
             // than against the line they stand in: left on the baseline an eighth
             // block hangs into the row below, and a bar misses the floor.
@@ -683,7 +734,22 @@ pub fn show(
         span.y.min(available.y).max(style.grid.cell.y),
     ) + Vec2::new(2.0 * style.pad, 2.0 * style.pad + strip);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
-    let focused = response.has_focus();
+    let ready = backend.lock().unwrap().is_some();
+    let can_focus =
+        ui.is_enabled() && !menu_open && ui.memory(|mem| mem.is_above_modal_layer(ui.layer_id()));
+    if can_focus
+        && (st.want_focus
+            || (ready && !st.connected_focus)
+            || response.clicked_by(egui::PointerButton::Primary))
+    {
+        st.want_focus = false;
+        st.connected_focus |= ready;
+        response.request_focus();
+    }
+    let focused = can_focus && response.has_focus();
+    if !focused || response.gained_focus() {
+        st.ime = Composition::default();
+    }
     // The cells live inside a rounded well: the padding keeps the first column
     // off the border and the radius keeps the corner from cutting glyphs.
     let well = Rect::from_min_size(
@@ -851,13 +917,6 @@ pub fn show(
     if focused {
         keyboard(ui, emu, backend, st, term_state, &mut out);
     }
-    if response.clicked_by(egui::PointerButton::Primary) && !focused {
-        response.request_focus();
-    }
-    if st.want_focus {
-        st.want_focus = false;
-        response.request_focus();
-    }
 
     // Paint after input so a drag's new endpoint is visible in this frame,
     // even when the pointer stops moving before the next repaint.
@@ -876,9 +935,97 @@ pub fn show(
             term.scroll_offset,
             focused,
         );
+        if focused && ui.memory(|mem| mem.owns_ime_events(response.id)) {
+            ime_output(ui, cells, term.cursor(), style, &st.ime);
+        }
     }
 
     out
+}
+
+/// Preedit stays local; the shell only receives the committed UTF-8 text.
+/// Publish the live cursor position so the OS can place its candidate window.
+fn ime_output(
+    ui: &Ui,
+    cells: Rect,
+    (row, col): (u16, u16),
+    style: &Style<'_>,
+    composition: &Composition,
+) {
+    let cell = style.grid.cell;
+    let origin = Pos2::new(
+        (cells.left() + col as f32 * cell.x).min(cells.right() - cell.x),
+        (cells.top() + row as f32 * cell.y).min(cells.bottom() - cell.y),
+    );
+    let mut cursor = Rect::from_min_size(origin, Vec2::new(1.0, cell.y));
+    if !composition.text.is_empty() {
+        let mut job = LayoutJob::default();
+        for (index, ch) in composition.text.chars().enumerate() {
+            let selected = composition
+                .active_range
+                .as_ref()
+                .is_some_and(|range| range.contains(&index));
+            job.append(
+                &ch.to_string(),
+                0.0,
+                TextFormat {
+                    font_id: style.font.clone(),
+                    color: rgb(if selected {
+                        style.palette.background
+                    } else {
+                        style.palette.foreground
+                    }),
+                    background: rgb(if selected {
+                        style.palette.foreground
+                    } else {
+                        style.palette.background
+                    }),
+                    underline: Stroke::new(1.0, rgb(style.palette.cursor)),
+                    ..Default::default()
+                },
+            );
+        }
+        let painter = ui.painter_at(cells);
+        let mut galley = painter.layout_job(job);
+        align_baseline(&mut galley, style.grid.baseline - style.grid.inset);
+        let at = Pos2::new(
+            origin
+                .x
+                .min((cells.right() - galley.size().x).max(cells.left())),
+            origin.y + style.grid.inset,
+        );
+        let cursor_char = composition
+            .active_range
+            .as_ref()
+            .map_or_else(|| composition.text.chars().count(), |range| range.end);
+        cursor.min.x = (at.x
+            + galley
+                .pos_from_cursor(egui::text::CCursor::new(cursor_char))
+                .left())
+        .clamp(cells.left(), cells.right() - 1.0);
+        cursor.max.x = cursor.min.x + 1.0;
+        painter.rect_filled(
+            Rect::from_min_size(
+                Pos2::new(at.x, origin.y),
+                Vec2::new(galley.size().x, cell.y),
+            ),
+            0.0,
+            rgb(style.palette.background),
+        );
+        painter.galley(at, galley, rgb(style.palette.foreground));
+    }
+    let to_global = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .unwrap_or_default();
+    ui.output_mut(|out| {
+        out.ime = Some(egui::output::IMEOutput {
+            purpose: egui::IMEPurpose::Normal,
+            rect: to_global * cells,
+            cursor_rect: to_global * cursor,
+            should_interrupt_composition: false,
+        });
+    });
 }
 
 /// Paint the strip a finished session is announced in, and report whether its
@@ -1015,8 +1162,31 @@ fn keyboard(
     state: TermState,
     out: &mut Output,
 ) {
+    let mut events = ui.input(|i| i.events.clone());
+    let bytes = keyboard_events(&mut events, emu, st, state, out);
+    ui.input_mut(|i| i.events = events);
+    if !bytes.is_empty() {
+        type_into(emu, backend, bytes);
+    }
+}
+
+fn keyboard_events(
+    events: &mut Vec<egui::Event>,
+    emu: &Arc<Mutex<Emulator>>,
+    st: &mut State,
+    state: TermState,
+    out: &mut Output,
+) -> Vec<u8> {
     let encoder = InputEncoder(state);
-    let events = ui.input(|i| i.events.clone());
+    // IME and key events can arrive in either order within a frame. Reserve
+    // the whole batch for composition, including the key that accepts/cancels
+    // a candidate, so Enter cannot accidentally execute the shell command.
+    let composing = !st.ime.text.is_empty()
+        || events.iter().any(|event| {
+            matches!(event,
+            egui::Event::Ime(egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text))
+                if !text.is_empty())
+        });
     // `Event::Text` already carries the keyboard layout and the shift state, so
     // printable keys must not be encoded a second time from their key event.
     let text_seen = events.iter().any(
@@ -1024,10 +1194,24 @@ fn keyboard(
     );
     let mut keep = Vec::new();
     let mut bytes = Vec::new();
-    let mut consumed = false;
 
-    for event in events {
+    for event in std::mem::take(events) {
         match event {
+            egui::Event::Ime(event) => match event {
+                egui::ImeEvent::Preedit {
+                    text,
+                    active_range_chars,
+                } => {
+                    st.ime.text = text;
+                    st.ime.active_range = active_range_chars;
+                }
+                egui::ImeEvent::Commit(text) => {
+                    bytes.extend_from_slice(text.as_bytes());
+                    st.ime = Composition::default();
+                }
+                _ => {}
+            },
+            egui::Event::Key { .. } | egui::Event::Text(_) if composing => {}
             egui::Event::Key {
                 key,
                 pressed: true,
@@ -1046,15 +1230,12 @@ fn keyboard(
                             out.copy = Some(text);
                         }
                     }
-                    consumed = true;
                 } else if paste_shortcut {
                     if let Some(text) = clipboard_text() {
                         bytes.extend(encoder.paste(&text));
                     }
-                    consumed = true;
                 } else if let Some(seq) = map_key(key, mods, text_seen, &encoder) {
                     bytes.extend(seq);
-                    consumed = true;
                 } else {
                     keep.push(egui::Event::Key {
                         key,
@@ -1073,40 +1254,32 @@ fn keyboard(
                             .encode(KeyCode::Char(first.unwrap()), Mods::default())
                             .unwrap_or_default(),
                     );
-                    consumed = true;
                 } else if text.chars().count() > 1 {
-                    bytes.extend(encoder.paste(text));
-                    consumed = true;
+                    bytes.extend_from_slice(text.as_bytes());
                 } else {
                     keep.push(event.clone());
                 }
             }
             egui::Event::Paste(ref text) => {
                 bytes.extend(encoder.paste(text));
-                consumed = true;
             }
-            egui::Event::Copy | egui::Event::Cut => {
-                match st.selection {
-                    Some(sel) => {
-                        let text = emu.lock().unwrap().text_between(sel.start, sel.end);
-                        if text.is_empty() {
-                            bytes.push(0x03);
-                        } else {
-                            out.copy = Some(text);
-                        }
+            egui::Event::Copy | egui::Event::Cut => match st.selection {
+                Some(sel) => {
+                    let text = emu.lock().unwrap().text_between(sel.start, sel.end);
+                    if text.is_empty() {
+                        bytes.push(0x03);
+                    } else {
+                        out.copy = Some(text);
                     }
-                    None => bytes.push(0x03),
                 }
-                consumed = true;
-            }
+                None => bytes.push(0x03),
+            },
             _ => keep.push(event.clone()),
         }
     }
 
-    if consumed {
-        ui.input_mut(|i| i.events = keep);
-        type_into(emu, backend, bytes);
-    }
+    *events = keep;
+    bytes
 }
 
 /// Map one physical key to bytes, or `None` to let `Event::Text` handle it.
@@ -1224,6 +1397,357 @@ pub const RELEASE: u16 = MOUSE_RELEASE;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        }
+    }
+
+    fn preedit(text: &str) -> egui::Event {
+        egui::Event::Ime(egui::ImeEvent::Preedit {
+            text: text.into(),
+            active_range_chars: Some(0..text.chars().count()),
+        })
+    }
+
+    fn input_bytes(st: &mut State, events: Vec<egui::Event>) -> Vec<u8> {
+        let emu = Arc::new(Mutex::new(Emulator::new(4, 40, 0)));
+        let mut events = events;
+        keyboard_events(
+            &mut events,
+            &emu,
+            st,
+            TermState {
+                bracketed_paste: true,
+                ..Default::default()
+            },
+            &mut Output::default(),
+        )
+    }
+
+    #[test]
+    fn ime_candidates_stay_local_and_commit_utf8_once() {
+        let mut st = State::default();
+        assert!(input_bytes(&mut st, vec![key(egui::Key::N), preedit("ni hao")]).is_empty());
+        assert_eq!(st.ime.text, "ni hao");
+        for key in [
+            egui::Key::Enter,
+            egui::Key::Backspace,
+            egui::Key::ArrowDown,
+            egui::Key::Space,
+            egui::Key::Num1,
+        ] {
+            assert!(input_bytes(&mut st, vec![self::key(key)]).is_empty());
+        }
+        let commit = egui::Event::Ime(egui::ImeEvent::Commit("你好、日本語、한글🙂".into()));
+        assert_eq!(
+            input_bytes(&mut st, vec![preedit(""), key(egui::Key::Enter), commit]),
+            "你好、日本語、한글🙂".as_bytes(),
+        );
+        assert!(st.ime.text.is_empty());
+        assert_eq!(input_bytes(&mut st, vec![key(egui::Key::Enter)]), b"\r");
+    }
+
+    #[test]
+    fn ime_commit_before_accept_key_does_not_execute_command() {
+        let mut st = State::default();
+        assert_eq!(
+            input_bytes(
+                &mut st,
+                vec![
+                    egui::Event::Ime(egui::ImeEvent::Commit("中文".into())),
+                    key(egui::Key::Enter),
+                ]
+            ),
+            "中文".as_bytes()
+        );
+        assert_eq!(
+            input_bytes(&mut st, vec![key(egui::Key::Backspace)]),
+            b"\x7f"
+        );
+    }
+
+    #[test]
+    fn cancelling_composition_restores_normal_terminal_keys() {
+        let mut st = State::default();
+        input_bytes(&mut st, vec![preedit("zhong")]);
+        assert!(input_bytes(&mut st, vec![key(egui::Key::Escape), preedit("")]).is_empty());
+        assert!(st.ime.text.is_empty());
+        assert_eq!(
+            input_bytes(&mut st, vec![key(egui::Key::ArrowUp)]),
+            b"\x1b[A"
+        );
+    }
+
+    #[test]
+    fn unicode_typing_and_bracketed_paste_remain_distinct() {
+        let mut st = State::default();
+        assert_eq!(
+            input_bytes(&mut st, vec![egui::Event::Text("é".into())]),
+            "é".as_bytes()
+        );
+        assert_eq!(
+            input_bytes(&mut st, vec![egui::Event::Text("中文🙂".into())]),
+            "中文🙂".as_bytes()
+        );
+        assert_eq!(
+            input_bytes(&mut st, vec![egui::Event::Paste("中文".into())]),
+            "\x1b[200~中文\x1b[201~".as_bytes()
+        );
+    }
+
+    fn terminal_frame(
+        ctx: &Context,
+        st: &mut State,
+        emu: &Arc<Mutex<Emulator>>,
+        backend: &Arc<Mutex<Option<Backend>>>,
+        events: Vec<egui::Event>,
+        other_focus: bool,
+    ) -> egui::FullOutput {
+        let palette = Palette::default();
+        let font = FontId::monospace(16.0);
+        let style = Style {
+            grid: measured_grid(&font, 1.0),
+            font,
+            palette: &palette,
+            cursor_on: true,
+            pad: 0.0,
+            radius: 0.0,
+            border: Color32::TRANSPARENT,
+        };
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(400.0, 200.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                if other_focus {
+                    ui.memory_mut(|mem| mem.request_focus(egui::Id::new("other-input")));
+                }
+                show(ui, emu, backend, st, &style, false, None);
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    #[test]
+    fn shell_readiness_focuses_once_and_accepts_the_first_input() {
+        let ctx = Context::default();
+        let mut st = State::default();
+        let emu = Arc::new(Mutex::new(Emulator::new(4, 40, 0)));
+        let backend = Arc::new(Mutex::new(None));
+        let output = terminal_frame(&ctx, &mut st, &emu, &backend, vec![], true);
+        assert!(!st.connected_focus);
+        assert!(output.platform_output.ime.is_none());
+
+        let (handle, mut rx) = crate::ssh::client::TerminalHandle::test_channel();
+        *backend.lock().unwrap() = Some(Backend::Ssh(handle));
+        let output = terminal_frame(
+            &ctx,
+            &mut st,
+            &emu,
+            &backend,
+            vec![egui::Event::Text("首字".into())],
+            false,
+        );
+        assert!(st.connected_focus);
+        assert!(output.platform_output.ime.is_some());
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::ssh::client::TermInput::Data(bytes)) if bytes == "首字".as_bytes())
+        );
+
+        terminal_frame(
+            &ctx,
+            &mut st,
+            &emu,
+            &backend,
+            vec![preedit("zhongwen")],
+            false,
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "preedit must never reach the SSH channel"
+        );
+        terminal_frame(
+            &ctx,
+            &mut st,
+            &emu,
+            &backend,
+            vec![
+                key(egui::Key::Enter),
+                egui::Event::Ime(egui::ImeEvent::Commit("中文".into())),
+            ],
+            false,
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(crate::ssh::client::TermInput::Data(bytes)) if bytes == "中文".as_bytes())
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the accept key must not send an extra command"
+        );
+
+        let output = terminal_frame(&ctx, &mut st, &emu, &backend, vec![], true);
+        assert!(
+            output.platform_output.ime.is_none(),
+            "a ready shell must not repeatedly steal focus"
+        );
+        assert_eq!(
+            ctx.memory(|mem| mem.focused()),
+            Some(egui::Id::new("other-input"))
+        );
+    }
+
+    #[test]
+    fn ime_tracks_terminal_cursor_and_clears_on_focus_loss() {
+        let ctx = Context::default();
+        let mut st = State {
+            want_focus: true,
+            ..Default::default()
+        };
+        let emu = Arc::new(Mutex::new(Emulator::new(4, 40, 0)));
+        emu.lock().unwrap().feed(b"\x1b[3;5H");
+        let backend = Arc::new(Mutex::new(None));
+        let output = terminal_frame(&ctx, &mut st, &emu, &backend, vec![], false);
+        let ime = output.platform_output.ime.unwrap();
+        let grid = measured_grid(&FontId::monospace(16.0), 1.0);
+        assert!((ime.cursor_rect.left() - ime.rect.left() - 4.0 * grid.cell.x).abs() < 0.1);
+        assert!((ime.cursor_rect.top() - ime.rect.top() - 2.0 * grid.cell.y).abs() < 0.1);
+        let output = terminal_frame(&ctx, &mut st, &emu, &backend, vec![preedit("nihao")], false);
+        assert_eq!(st.ime.text, "nihao");
+        assert!(output
+            .shapes
+            .iter()
+            .any(|s| matches!(&s.shape, egui::Shape::Text(text) if text.galley.text() == "nihao")));
+        assert!(!emu.lock().unwrap().screen().contents().contains("nihao"));
+        let output = terminal_frame(&ctx, &mut st, &emu, &backend, vec![], true);
+        assert!(output.platform_output.ime.is_none());
+        assert!(st.ime.text.is_empty());
+    }
+
+    fn check_mixed_baselines(fonts: egui::FontDefinitions, text: &str) {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let ctx = Context::default();
+            ctx.set_fonts(fonts.clone());
+            ctx.set_pixels_per_point(scale);
+            for size in [12.0, 14.0, 18.0] {
+                for spacing in [0.8, 1.2] {
+                    let font = FontId::monospace(size);
+                    let palette = Palette::default();
+                    let mut term = Emulator::new(3, 100, 0);
+                    // Also exercise colour/italic sections and a Latin-only row.
+                    term.feed(format!("{text}\x1b[31;3m tail\x1b[0m\r\nHxlp|_").as_bytes());
+                    let mut grid = Grid::default();
+                    let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                        grid = Grid::measure(&ctx, &font, spacing);
+                        let style = Style {
+                            font: font.clone(),
+                            grid,
+                            palette: &palette,
+                            cursor_on: false,
+                            pad: 0.0,
+                            radius: 0.0,
+                            border: Color32::TRANSPARENT,
+                        };
+                        paint(
+                            ui.painter(),
+                            &ctx,
+                            Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 300.0)),
+                            &term,
+                            &style,
+                            &mut Guesses::default(),
+                            None,
+                            3,
+                            100,
+                            0,
+                            true,
+                        );
+                    });
+                    output.textures_delta.clear();
+                    let mut checked = 0;
+                    for clipped in &output.shapes {
+                        let egui::Shape::Text(painted) = &clipped.shape else {
+                            continue;
+                        };
+                        let row_index = ((painted.pos.y - grid.inset) / grid.cell.y).round();
+                        let expected = row_index * grid.cell.y + grid.baseline;
+                        let original =
+                            ctx.fonts_mut(|fonts| fonts.layout_job((*painted.galley.job).clone()));
+                        for (row, before) in painted.galley.rows.iter().zip(&original.rows) {
+                            let baseline = row.glyphs[0].pos.y;
+                            assert!(
+                                (painted.pos.y + baseline - expected).abs() < 0.01,
+                                "mixed and Latin-only rows must use the grid baseline"
+                            );
+                            for (index, glyph) in row.glyphs.iter().enumerate() {
+                                assert!((glyph.pos.y - baseline).abs() < 0.01,
+                                    "{:?} baseline {} differs from {baseline} at {size} pt / {scale}x",
+                                    glyph.chr, glyph.pos.y);
+                                let old = &before.glyphs[index];
+                                assert_eq!(glyph.pos.x, old.pos.x, "columns must stay fixed");
+                                let start = glyph.first_vertex as usize;
+                                let end = row
+                                    .glyphs
+                                    .get(index + 1)
+                                    .map_or(row.visuals.glyph_vertex_range.end, |next| {
+                                        next.first_vertex as usize
+                                    });
+                                for vertex in start..end {
+                                    let a = row.visuals.mesh.vertices[vertex];
+                                    let b = before.visuals.mesh.vertices[vertex];
+                                    assert_eq!(a.pos.x, b.pos.x);
+                                    assert_eq!(a.uv, b.uv);
+                                    assert_eq!(a.color, b.color);
+                                    assert!(
+                                        (a.pos.y - b.pos.y - (baseline - old.pos.y)).abs() < 0.01,
+                                        "glyph mesh must move with its baseline"
+                                    );
+                                }
+                                checked += 1;
+                            }
+                            assert_eq!(row.visuals.mesh_bounds, row.visuals.mesh.calc_bounds());
+                        }
+                    }
+                    assert!(
+                        checked > text.chars().count(),
+                        "no terminal text was painted"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_text_shares_the_terminal_baseline() {
+        check_mixed_baselines(egui::FontDefinitions::default(), "Hxlp|_ \u{1f600} English");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn chinese_and_english_share_the_terminal_baseline() {
+        let mut fonts = egui::FontDefinitions::default();
+        let Ok(data) = std::fs::read(r"C:\Windows\Fonts\msyh.ttc") else {
+            eprintln!("skipping CJK font check: Microsoft YaHei is not installed");
+            return;
+        };
+        fonts.font_data.insert(
+            "CJK".to_string(),
+            Arc::new(egui::FontData::from_owned(data)),
+        );
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .push("CJK".to_string());
+        check_mixed_baselines(fonts, "INFO 请求参数值: callChannel 返回值: 成功 200");
+    }
 
     /// `Grid::measure` for `font`, taken in a context of its own: egui has no
     /// fonts until a context has begun a pass, and a test measures before it
