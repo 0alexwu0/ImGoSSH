@@ -17,7 +17,7 @@ fn main() -> eframe::Result {
     let cli = Args::parse();
 
     let config = Config::load();
-    let viewport = imgossh::ui::chrome::startup_viewport(egui::ViewportBuilder::default())
+    let viewport = egui::ViewportBuilder::default()
         .with_inner_size([config.window_width, config.window_height])
         .with_min_inner_size([760.0, 420.0])
         .with_title(format!("{APP_NAME} {APP_VERSION}"))

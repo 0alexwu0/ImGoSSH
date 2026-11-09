@@ -54,14 +54,14 @@ SFTP 可以作为独立标签页打开，也可以停靠在终端右侧。双栏
 
 ## 下载
 
-最新版本：[v0.3.1](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.1)
+最新版本：[v0.3.2](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.2)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.1/ImGoSSH-0.3.1-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.2/ImGoSSH-0.3.2-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
 每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md`、使用文档、JumpServer 连接器和反向工作区辅助脚本。Release 页面同时提供 SHA-256 校验值。
 
@@ -71,12 +71,19 @@ Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发�
 xattr -dr com.apple.quarantine <解压目录>
 ```
 
+## v0.3.2 更新
+
+- 恢复系统原生标题栏，撤回自绘标题栏、无边框缩放热区和反复刷新原生框架，针对 Win10 界面抖动问题。
+- 关闭 Windows 原生窗口主题同步；Win10 启动时清除窗口库的深色样式覆盖，使用标准浅色标题栏，应用内部主题继续保留。
+- 修正输入法候选窗口定位，将候选排除区域限制在终端光标，保留非英文输入与 SSH 连接后自动聚焦。
+
+详细说明见 [v0.3.2 发布说明](docs/release-0.3.2.md)。Win10 的点击、输入和高 DPI 显示仍需实机确认。
+
 ## v0.3.1 更新
 
 - SSH shell 就绪后自动聚焦终端，切换标签页后可直接输入。
 - 支持中文、日文、韩文等输入法预编辑和 UTF-8 输入，候选窗口跟随终端光标，选字回车不会误执行远端命令。
 - 统一主字体与中文回退字体的文字基线，修正中英文混排时上下错位。
-- Win10 在创建窗口时直接使用跟随软件主题的标题栏，修正启动时白色标题栏闪烁；保留拖动、窗口按钮及边缘缩放。
 - 更新 README 与功能截图，展示 SSH、SFTP 双栏文件管理、反向工作区和外观设置。
 
 详细说明见 [v0.3.1 发布说明](docs/release-0.3.1.md)。截图拍摄版本与演示数据说明见 [截图说明](docs/screenshots/README.md)。
@@ -182,7 +189,7 @@ igworkspace cancel 1
 
 支持简体中文和英文界面，语言默认跟随系统。设置中可切换 ImGo、Dark、Light 三套界面主题，以及 ImGo Dark、Charcoal、ImGo Light、Xterm 四套终端调色板，调整字体、字号、行距和回滚行数。终端内置 Hack 字体，并为框线、方块等字符提供字体回退。
 
-Windows 标题栏跟随界面主题：Win11 使用系统标题栏配色，Win10 从窗口创建起使用软件绘制的主题标题栏，支持拖动、双击最大化、边缘缩放和最小化 / 最大化 / 关闭按钮。
+Windows 使用系统原生标题栏，应用主题不会同步修改原生窗口主题。Win10 启动时额外清除窗口库自动套用的深色样式，使用标准浅色原生标题栏，针对点击标题栏后标题文字和按钮绘制异常的问题；Win11 保留系统默认标题栏。应用内的界面主题和终端配色可独立设置。
 
 「帮助 → 检查更新」可以手动检查 GitHub Releases。自动检查默认开启，成功检查后的间隔为 6 小时，可在设置中关闭；发现更新后由用户确认下载和安装，完成后重启生效。
 
@@ -415,7 +422,7 @@ cargo test --test live_server -- --ignored --nocapture --test-threads=1
 - 反向工作区默认关闭，文件写入与本机执行分别授权。执行使用客户端当前用户的权限，工作目录不构成沙箱；仅向可信服务器启用执行权限。连接断开后取消运行中的任务，并清理共享服务。
 - JumpServer 接入目前仅提供 Windows 配置适配。SSH/SFTP 已通过本地网关协议测试，真实资产权限、传输和审计仍需在实际部署中验证。
 - JumpServer Client 2.1.4 的接口通过进程参数传递临时令牌，本机有相应权限的进程可能读取；旧版配置会借用 XShell / WinSCP 图标槽位，卸载可恢复。
-- Win10 标题栏修复已通过回归测试，当前开发机为 Win11，仍需在发生问题的 Win10 环境确认。
+- 因 Win10 输入时出现整页抖动，已撤回标题栏配色和自绘改动，恢复系统原生窗口；恢复后的显示效果仍需在原 Win10 环境确认。
 - 当前不包含 X11、RDP、VNC、FTP、Telnet 或串口功能。
 - 文件浏览器不会自动跟随终端中的 `cd`。
 - Linux 和 macOS 已通过自动化构建与测试，但不同桌面环境的字体、剪贴板和文件对话框仍可能存在差异。

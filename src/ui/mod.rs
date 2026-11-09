@@ -1,7 +1,6 @@
 //! The egui front-end: session sidebar, terminal tabs, SFTP browser, dialogs.
 //!
 //! * [`app`] - the `eframe::App` shell that owns tabs, modals and the runtime.
-//! * [`chrome`] - the themed window frame and Windows 10 caption fallback.
 //! * [`terminal`] - the VT100 widget.
 //! * [`sidebar`] - the session tree.
 //! * [`browser`] - the dual-pane SFTP / local file browser.
@@ -11,13 +10,14 @@
 
 pub mod app;
 pub mod browser;
-pub mod chrome;
 pub mod dialogs;
 pub mod properties;
 mod security;
 pub mod sidebar;
 pub mod terminal;
 pub mod theme;
+#[cfg(target_os = "windows")]
+mod windows_caption;
 
 pub use app::{App, Startup};
 

@@ -153,6 +153,12 @@ pub fn tokens(theme: Theme, palette: &Palette) -> Tokens {
 /// Dress the context with a theme. Idempotent: every field is written from
 /// scratch, so switching themes never leaves paint from the previous one.
 pub fn apply(ctx: &Context, theme: Theme, palette: &Palette, mono: f32) {
+    // Keep the native Windows caption under the system's control. egui's
+    // default theme sync calls winit's DarkMode_Explorer override, which can
+    // leave Win10 caption text and buttons unreadable after activation.
+    #[cfg(target_os = "windows")]
+    ctx.options_mut(|options| options.sync_window_theme = false);
+
     let t = tokens(theme, palette);
     let egui_theme = if t.dark {
         EguiTheme::Dark
@@ -617,6 +623,107 @@ mod tests {
             (Theme::Dark, tokens(Theme::Dark, &palette)),
             (Theme::Light, tokens(Theme::Light, &palette)),
         ]
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn changing_app_theme_preserves_the_native_caption() {
+        let ctx = Context::default();
+        let palette = Palette::default();
+        for theme in [Theme::ImGo, Theme::Light, Theme::Dark, Theme::ImGo] {
+            for focused in [true, false, true] {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        focused,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        apply(ui.ctx(), theme, &palette, 14.0);
+                        assert_eq!(
+                            ui.ctx().global_style().visuals.dark_mode,
+                            theme != Theme::Light
+                        );
+                        egui::CentralPanel::default().show(ui, |ui| {
+                            ui.label("SSH 终端");
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+                for viewport in output.viewport_output.values() {
+                    assert!(
+                        !viewport.commands.iter().any(|command| matches!(
+                            command,
+                            egui::ViewportCommand::SetTheme(_)
+                                | egui::ViewportCommand::Decorations(_)
+                                | egui::ViewportCommand::InnerSize(_)
+                                | egui::ViewportCommand::OuterPosition(_)
+                        )),
+                        "{theme:?}, focused={focused}: {:?}",
+                        viewport.commands
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn opening_and_closing_menus_does_not_change_the_native_window() {
+        let ctx = Context::default();
+        let mut menu_rect = Rect::NOTHING;
+        for theme in [Theme::ImGo, Theme::Light, Theme::Dark] {
+            let mut open = false;
+            for step in 0..7 {
+                let pointer = menu_rect.center();
+                let events = match step {
+                    1 | 2 | 4 | 5 => vec![
+                        egui::Event::PointerMoved(pointer),
+                        egui::Event::PointerButton {
+                            pos: pointer,
+                            button: egui::PointerButton::Primary,
+                            pressed: matches!(step, 1 | 4),
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    _ => vec![],
+                };
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1000.0, 700.0),
+                        )),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        apply(ui.ctx(), theme, &Palette::default(), 14.0);
+                        egui::Panel::top("menubar").show(ui, |ui| {
+                            egui::MenuBar::new().ui(ui, |ui| {
+                                let (button, popup) =
+                                    egui::menu::MenuButton::new("Session").ui(ui, |ui| {
+                                        ui.label("New SSH session");
+                                    });
+                                menu_rect = button.rect;
+                                open = popup.is_some();
+                            });
+                        });
+                    },
+                );
+                output.textures_delta.clear();
+                for viewport in output.viewport_output.values() {
+                    assert!(
+                        viewport.commands.is_empty(),
+                        "menu interaction modified the native window: {:?}",
+                        viewport.commands
+                    );
+                }
+                if step == 3 {
+                    assert!(open, "the click did not open the menu");
+                }
+            }
+            assert!(!open, "the second click did not close the menu");
+        }
     }
 
     #[test]

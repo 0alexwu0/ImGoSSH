@@ -1020,8 +1020,11 @@ fn ime_output(
         .unwrap_or_default();
     ui.output_mut(|out| {
         out.ime = Some(egui::output::IMEOutput {
-            purpose: egui::IMEPurpose::Normal,
-            rect: to_global * cells,
+            purpose: egui::IMEPurpose::Terminal,
+            // egui-winit 0.36 forwards `rect`, not `cursor_rect`, to winit.
+            // Sending the entire terminal made Windows exclude the whole
+            // screen when positioning IME UI on every keyboard event.
+            rect: to_global * cursor,
             cursor_rect: to_global * cursor,
             should_interrupt_composition: false,
         });
@@ -1618,10 +1621,20 @@ mod tests {
         let output = terminal_frame(&ctx, &mut st, &emu, &backend, vec![], false);
         let ime = output.platform_output.ime.unwrap();
         let grid = measured_grid(&FontId::monospace(16.0), 1.0);
-        assert!((ime.cursor_rect.left() - ime.rect.left() - 4.0 * grid.cell.x).abs() < 0.1);
-        assert!((ime.cursor_rect.top() - ime.rect.top() - 2.0 * grid.cell.y).abs() < 0.1);
+        assert!((ime.cursor_rect.left() - 4.0 * grid.cell.x).abs() < 0.1);
+        assert!((ime.cursor_rect.top() - 2.0 * grid.cell.y).abs() < 0.1);
+        // The integration sends `rect` to the native IME; it must be the
+        // caret area rather than the entire terminal widget.
+        assert_eq!(ime.rect, ime.cursor_rect);
+        assert_eq!(ime.purpose, egui::IMEPurpose::Terminal);
+        assert_eq!(ime.rect.width(), 1.0);
+        assert_eq!(ime.rect.height(), grid.cell.y);
         let output = terminal_frame(&ctx, &mut st, &emu, &backend, vec![preedit("nihao")], false);
         assert_eq!(st.ime.text, "nihao");
+        let composing_ime = output.platform_output.ime.as_ref().unwrap();
+        assert_eq!(composing_ime.rect, composing_ime.cursor_rect);
+        assert_eq!(composing_ime.rect.top(), ime.rect.top());
+        assert!(composing_ime.rect.left() > ime.rect.left());
         assert!(output
             .shapes
             .iter()

@@ -221,6 +221,11 @@ impl Default for Monitor {
 }
 
 impl Monitor {
+    #[cfg(test)]
+    pub(crate) fn set_test_info(&self, info: ServerInfo) {
+        *self.info.lock().unwrap() = Some(info);
+    }
+
     /// Create the shared slots before there is a connection to poll.
     pub fn new() -> Self {
         Self {

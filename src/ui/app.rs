@@ -23,7 +23,6 @@ pub use crate::startup::Startup;
 use crate::t;
 use crate::terminal::Emulator;
 use crate::ui::browser::Browser;
-use crate::ui::chrome;
 use crate::ui::dialogs::{self, ChallengeBuffer};
 use crate::ui::sidebar::{self, Sidebar};
 use crate::ui::terminal::{self as term_widget, Grid, Style as TermStyle};
@@ -176,8 +175,6 @@ pub struct App {
     update_failed_at: Option<std::time::SystemTime>,
     /// Set once the new binaries are on disk: `on_exit` starts the program.
     restarting: bool,
-    /// The native window frame, kept the same colour as the panels.
-    chrome: chrome::Chrome,
     term_menu: Option<(egui::Pos2, usize)>,
     /// Set on the frame the terminal menu opens, so the click that opened it
     /// cannot be mistaken for the click that dismisses it.
@@ -205,6 +202,8 @@ impl App {
 
     /// Build the shell and queue whatever the command line asked for.
     pub fn with_startup(cc: &eframe::CreationContext<'_>, startup: Startup) -> Self {
+        #[cfg(target_os = "windows")]
+        super::windows_caption::initialize(cc);
         let store = Store::load();
         // The copies a previous update moved aside go now, while nothing is
         // holding them open.
@@ -275,7 +274,6 @@ impl App {
             update_seen: None,
             update_failed_at: None,
             restarting: false,
-            chrome: chrome::Chrome::default(),
             term_menu: None,
             term_menu_fresh: false,
             grid,
@@ -1089,17 +1087,6 @@ impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ctx = Some(ctx.clone());
         self.apply_theme(ctx);
-        // Match the native caption to the panels, or draw it ourselves when
-        // the compositor cannot set its colours (Windows 10).
-        let tokens = theme::tokens(self.store.config.theme, &self.palette);
-        self.chrome.follow(
-            ctx,
-            chrome::Want {
-                caption: tokens.surface,
-                text: tokens.text,
-                dark: tokens.dark,
-            },
-        );
         self.poll_prompts();
         self.poll_updater(ctx);
         if self.poll_connections() {
@@ -1151,15 +1138,6 @@ impl eframe::App for App {
             tab.monitor.set_paused(idle);
         }
 
-        let tokens = theme::tokens(self.store.config.theme, &self.palette);
-        self.chrome.show(
-            ui,
-            chrome::Want {
-                caption: tokens.surface,
-                text: tokens.text,
-                dark: tokens.dark,
-            },
-        );
         self.menu_bar(ui);
         if self.store.config.show_toolbar {
             self.tool_bar(ui);
@@ -1212,7 +1190,6 @@ impl eframe::App for App {
             });
 
         self.dialogs(&ctx);
-        self.chrome.resize_frame(ui);
     }
 
     fn on_exit(&mut self) {
@@ -3348,6 +3325,135 @@ fn menu_is_dismissed(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typing_keeps_the_native_window_layout_stable() {
+        use super::*;
+        use eframe::App as _;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::load_from(dir.path(), false);
+        let palette = store.config.palette();
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .worker_threads(1)
+                .build()
+                .unwrap(),
+        );
+        let (prompter, prompts) = Prompter::channel();
+        let ctx = Context::default();
+        let mut app = App {
+            store,
+            palette,
+            runtime,
+            ctx: Some(ctx.clone()),
+            tabs: Vec::new(),
+            active: 0,
+            sidebar: Sidebar::default(),
+            queue: Queue::new(),
+            prompter,
+            prompts,
+            pending: None,
+            editor: None,
+            editor_index: None,
+            confirm_close: None,
+            name_prompt: None,
+            workspace_runner: None,
+            show_settings: false,
+            security: None,
+            deferred_startup: None,
+            storage_error: None,
+            jumpserver_report: None,
+            jumpserver_notice: None,
+            show_transfers: false,
+            show_about: false,
+            updater: update::Updater::new(),
+            show_update: false,
+            update_seen: None,
+            update_failed_at: None,
+            restarting: false,
+            term_menu: None,
+            term_menu_fresh: false,
+            grid: Grid::default(),
+            spacing: 0.0,
+            scale: 0.0,
+            font: FontId::monospace(14.0),
+            cursor_on: true,
+            blink_at: 0.0,
+            dirty: false,
+        };
+        app.store.config.last_update_check = update::epoch_seconds(std::time::SystemTime::now());
+        app.store.config.show_server_monitor = true;
+        let session = app.store.config.new_session(Protocol::Ssh);
+        app.new_tab(session);
+        app.tabs[0].monitor.set_test_info(ServerInfo {
+            hostname: "production-server-long-hostname".into(),
+            mem_total: 32 * 1024 * 1024 * 1024,
+            mem_used: 16 * 1024 * 1024 * 1024,
+            users: vec!["admin".repeat(8)],
+            ..Default::default()
+        });
+        *app.tabs[0].status.lock().unwrap() = Status::Running;
+        let (handle, mut rx) = crate::ssh::client::TerminalHandle::test_channel();
+        *app.tabs[0].backend.lock().unwrap() = Some(Backend::Ssh(handle));
+        let mut frame = eframe::Frame::_new_kittest();
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            ctx.set_pixels_per_point(scale);
+            let mut positions = Vec::new();
+            for index in 0..20 {
+                let events = if index > 3 {
+                    vec![egui::Event::Text("a".into())]
+                } else {
+                    vec![]
+                };
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1200.0, 760.0),
+                        )),
+                        time: Some(index as f64 / 10.0),
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| {
+                        app.logic(ui.ctx(), &mut frame);
+                        app.ui(ui, &mut frame);
+                    },
+                );
+                output.textures_delta.clear();
+                if index > 3 {
+                    assert!(
+                        output.viewport_output[&egui::ViewportId::ROOT]
+                            .commands
+                            .iter()
+                            .all(|cmd| !matches!(
+                                cmd,
+                                egui::ViewportCommand::InnerSize(_)
+                                    | egui::ViewportCommand::OuterPosition(_)
+                                    | egui::ViewportCommand::Decorations(_)
+                                    | egui::ViewportCommand::StartDrag
+                                    | egui::ViewportCommand::BeginResize(_)
+                            )),
+                        "typing must not move, resize or reframe the window"
+                    );
+                }
+                let ime = output.platform_output.ime.expect("terminal lost focus");
+                positions.push((
+                    ime.rect.top(),
+                    ime.rect.bottom(),
+                    app.tabs[0].emu.lock().unwrap().size(),
+                ));
+                while let Ok(crate::ssh::client::TermInput::Data(data)) = rx.try_recv() {
+                    app.tabs[0].emu.lock().unwrap().feed(&data);
+                }
+            }
+            assert!(
+                positions[4..].iter().all(|pos| *pos == positions[4]),
+                "layout changes at {scale}x: {positions:?}"
+            );
+        }
+    }
+
     use super::*;
 
     // The coverage probe is the whole basis for choosing a face, so it has to see
