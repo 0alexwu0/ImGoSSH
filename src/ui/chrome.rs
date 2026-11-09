@@ -87,6 +87,9 @@ fn needs_custom_caption(version: Option<(u32, u32)>) -> bool {
 
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
 const ATTEMPTS: u8 = 5;
+/// Height of the application-drawn caption on borderless Windows 10 windows.
+/// Keeping layout and hit testing on one value avoids DPI rounding drift.
+pub const CUSTOM_CAPTION_HEIGHT: f32 = 32.0;
 
 impl Chrome {
     pub fn follow(&mut self, ctx: &egui::Context, want: Want) {
@@ -132,106 +135,108 @@ impl Chrome {
             return;
         }
         let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
-        egui::Panel::top("application-caption")
-            .exact_size(32.0)
-            .show_separator_line(false)
-            .frame(egui::Frame::new().fill(want.caption))
-            .show(ui, |ui| {
-                let rect = ui.max_rect();
-                let buttons_left = rect.right() - 3.0 * 46.0;
-                let drag_rect =
-                    egui::Rect::from_min_max(rect.min, egui::pos2(buttons_left, rect.bottom()));
-                let response = ui.interact(
-                    drag_rect,
-                    ui.id().with("drag"),
-                    egui::Sense::click_and_drag(),
-                );
-                if response.double_clicked() {
-                    ui.ctx()
-                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                } else if response.drag_started_by(egui::PointerButton::Primary) {
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                }
-                let mut logo =
-                    ui.new_child(egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-                        rect.min + egui::vec2(8.0, 7.0),
-                        egui::vec2(18.0, 18.0),
-                    )));
-                super::theme::logo(&mut logo, 18.0);
-                let title = ui.input(|i| i.viewport().title.clone()).unwrap_or_else(|| {
-                    format!("{} {}", crate::config::APP_NAME, crate::config::APP_VERSION)
-                });
-                ui.painter().with_clip_rect(drag_rect).text(
-                    rect.min + egui::vec2(34.0, 16.0),
-                    egui::Align2::LEFT_CENTER,
-                    title,
-                    egui::FontId::proportional(12.0),
-                    want.text,
-                );
-                for (index, label, command) in [
-                    (
-                        0,
-                        crate::t!("Minimize"),
-                        egui::ViewportCommand::Minimized(true),
-                    ),
-                    (
-                        1,
-                        if maximized {
-                            crate::t!("Restore")
-                        } else {
-                            crate::t!("Maximize")
-                        },
-                        egui::ViewportCommand::Maximized(!maximized),
-                    ),
-                    (2, crate::t!("Close"), egui::ViewportCommand::Close),
-                ] {
-                    let button = egui::Rect::from_min_size(
-                        egui::pos2(buttons_left + index as f32 * 46.0, rect.top()),
-                        egui::vec2(46.0, 32.0),
-                    );
-                    let response = ui.interact(button, ui.id().with(index), egui::Sense::click());
-                    let mut color = want.text;
-                    if response.hovered() {
-                        let fill = if index == 2 {
-                            color = Color32::WHITE;
-                            Color32::from_rgb(196, 43, 28)
-                        } else {
-                            ui.visuals().widgets.hovered.bg_fill
-                        };
-                        ui.painter().rect_filled(button, 0.0, fill);
-                    }
-                    let centre = button.center();
-                    let icon = egui::Rect::from_center_size(centre, egui::vec2(10.0, 10.0));
-                    let stroke = egui::Stroke::new(1.0, color);
-                    match index {
-                        0 => {
-                            ui.painter().hline(icon.x_range(), centre.y, stroke);
-                        }
-                        1 => {
-                            if maximized {
-                                ui.painter().rect_stroke(
-                                    icon.translate(egui::vec2(2.0, -2.0)),
-                                    0.0,
-                                    stroke,
-                                    egui::StrokeKind::Inside,
-                                );
-                            }
-                            ui.painter()
-                                .rect_stroke(icon, 0.0, stroke, egui::StrokeKind::Inside);
-                        }
-                        _ => {
-                            ui.painter()
-                                .line_segment([icon.left_top(), icon.right_bottom()], stroke);
-                            ui.painter()
-                                .line_segment([icon.right_top(), icon.left_bottom()], stroke);
-                        }
-                    }
-                    if response.clicked() {
-                        ui.ctx().send_viewport_cmd(command);
-                    }
-                    response.on_hover_text(label);
-                }
+        // Allocate the caption directly instead of using a persisted `Panel`.
+        // A top panel may re-resolve its remembered outer size while Win10 is
+        // changing DPI or processing a borderless resize, which makes the
+        // entire content jump by a pixel on alternating frames.
+        let (rect, _) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), CUSTOM_CAPTION_HEIGHT),
+            egui::Sense::hover(),
+        );
+        ui.painter().rect_filled(rect, 0.0, want.caption);
+        {
+            let buttons_left = rect.right() - 3.0 * 46.0;
+            let drag_rect =
+                egui::Rect::from_min_max(rect.min, egui::pos2(buttons_left, rect.bottom()));
+            let response = ui.interact(
+                drag_rect,
+                ui.id().with("drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if response.double_clicked() {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            } else if response.drag_started_by(egui::PointerButton::Primary) {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            let mut logo = ui.new_child(egui::UiBuilder::new().max_rect(
+                egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 7.0), egui::vec2(18.0, 18.0)),
+            ));
+            super::theme::logo(&mut logo, 18.0);
+            let title = ui.input(|i| i.viewport().title.clone()).unwrap_or_else(|| {
+                format!("{} {}", crate::config::APP_NAME, crate::config::APP_VERSION)
             });
+            ui.painter().with_clip_rect(drag_rect).text(
+                rect.min + egui::vec2(34.0, 16.0),
+                egui::Align2::LEFT_CENTER,
+                title,
+                egui::FontId::proportional(12.0),
+                want.text,
+            );
+            for (index, label, command) in [
+                (
+                    0,
+                    crate::t!("Minimize"),
+                    egui::ViewportCommand::Minimized(true),
+                ),
+                (
+                    1,
+                    if maximized {
+                        crate::t!("Restore")
+                    } else {
+                        crate::t!("Maximize")
+                    },
+                    egui::ViewportCommand::Maximized(!maximized),
+                ),
+                (2, crate::t!("Close"), egui::ViewportCommand::Close),
+            ] {
+                let button = egui::Rect::from_min_size(
+                    egui::pos2(buttons_left + index as f32 * 46.0, rect.top()),
+                    egui::vec2(46.0, CUSTOM_CAPTION_HEIGHT),
+                );
+                let response = ui.interact(button, ui.id().with(index), egui::Sense::click());
+                let mut color = want.text;
+                if response.hovered() {
+                    let fill = if index == 2 {
+                        color = Color32::WHITE;
+                        Color32::from_rgb(196, 43, 28)
+                    } else {
+                        ui.visuals().widgets.hovered.bg_fill
+                    };
+                    ui.painter().rect_filled(button, 0.0, fill);
+                }
+                let centre = button.center();
+                let icon = egui::Rect::from_center_size(centre, egui::vec2(10.0, 10.0));
+                let stroke = egui::Stroke::new(1.0, color);
+                match index {
+                    0 => {
+                        ui.painter().hline(icon.x_range(), centre.y, stroke);
+                    }
+                    1 => {
+                        if maximized {
+                            ui.painter().rect_stroke(
+                                icon.translate(egui::vec2(2.0, -2.0)),
+                                0.0,
+                                stroke,
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        ui.painter()
+                            .rect_stroke(icon, 0.0, stroke, egui::StrokeKind::Inside);
+                    }
+                    _ => {
+                        ui.painter()
+                            .line_segment([icon.left_top(), icon.right_bottom()], stroke);
+                        ui.painter()
+                            .line_segment([icon.right_top(), icon.left_bottom()], stroke);
+                    }
+                }
+                if response.clicked() {
+                    ui.ctx().send_viewport_cmd(command);
+                }
+                response.on_hover_text(label);
+            }
+        }
     }
 
     /// Borderless windows need explicit resize handles, including all corners.
@@ -243,6 +248,10 @@ impl Chrome {
         {
             return;
         }
+        // Use the current viewport rectangle only for hit testing; never issue
+        // a size/position command from this overlay. Window geometry belongs to
+        // winit, and sending geometry changes every frame causes Win10 to
+        // oscillate while DWM is processing a resize or DPI update.
         let rect = ui.ctx().viewport_rect();
         let edge = 5.0;
         use egui::{CursorIcon as C, ResizeDirection as D};
