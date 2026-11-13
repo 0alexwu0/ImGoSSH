@@ -54,14 +54,14 @@ SFTP 可以作为独立标签页打开，也可以停靠在终端右侧。双栏
 
 ## 下载
 
-最新版本：[v0.3.3](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.3)
+最新版本：[v0.3.4](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.4)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.3/ImGoSSH-0.3.3-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
 每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md`、使用文档、JumpServer 连接器和反向工作区辅助脚本。Release 页面同时提供 SHA-256 校验值。
 
@@ -70,6 +70,14 @@ Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发�
 ```bash
 xattr -dr com.apple.quarantine <解压目录>
 ```
+
+## v0.3.4 更新
+
+- Windows 下 JumpServer 的 SSH/SFTP 连接复用已运行的 ImGoSSH 窗口，新建并选中标签页，恢复最小化窗口。
+- 支持窗口初始化期间接收连接及并发唤起；接收窗口关闭后，其他已打开窗口可接管后续连接。
+- 临时连接参数通过本机命名管道转交，不写入磁盘；手动启动多个窗口的行为保留。
+
+详细说明见 [v0.3.4 发布说明](docs/release-0.3.4.md)。升级后请重启已有窗口，使其具备接收连接的能力。
 
 ## v0.3.3 更新
 
@@ -135,6 +143,7 @@ Windows 下正常打开 ImGoSSH 时会自动检查已安装客户端的 SSH 和 
 JumpServer 桌面客户端，备份并写入配置。两项均已配置时不关闭、不重复写入。客户端 4 秒内未正常退出时会结束对应桌面进程；由 JumpServer 唤起的连接窗口跳过自动配置。
 配置位于受保护目录且无写权限时会提示失败原因，可用管理员身份重新打开。
 之后重新打开 JumpServer，以 SSH 客户端方式连接资产，或以 SFTP 客户端方式浏览目录、上传和下载文件。
+Windows 下已有 ImGoSSH 接收窗口时，JumpServer 连接会在该窗口中新建并选中标签页，恢复最小化窗口；否则正常启动应用。临时连接参数通过本机命名管道转交，不写入磁盘。
 自定义路径、手动安装及恢复见 [JumpServer 集成说明](integrations/jumpserver/README.md)。临时连接仅保留在当前窗口内存中，
 不会自动加入已保存会话；SSH 模式默认关闭附带的 SFTP 面板；SFTP 模式直接打开文件浏览器。两种模式均关闭 SSH agent 和服务器监控。
 

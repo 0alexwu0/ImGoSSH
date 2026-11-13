@@ -17,6 +17,8 @@ pub mod cli;
 pub mod config;
 pub mod i18n;
 pub mod icon;
+#[cfg(windows)]
+pub mod instance;
 pub mod jumpserver;
 pub mod line_drawing;
 pub mod ssh;

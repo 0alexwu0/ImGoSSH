@@ -16,6 +16,20 @@ fn main() -> eframe::Result {
     env_logger::init();
     let cli = Args::parse();
 
+    #[cfg(windows)]
+    let instance = match imgossh::instance::Instance::start(&cli) {
+        Ok(imgossh::instance::Launch::Forwarded) => return Ok(()),
+        Ok(imgossh::instance::Launch::Window(instance)) => instance,
+        Err(err) => {
+            rfd::MessageDialog::new()
+                .set_title(APP_NAME)
+                .set_level(rfd::MessageLevel::Error)
+                .set_description(format!("Could not open the connection in ImGoSSH: {err}"))
+                .show();
+            return Err(eframe::Error::AppCreation(Box::new(err)));
+        }
+    };
+
     let config = Config::load();
     let viewport = egui::ViewportBuilder::default()
         .with_inner_size([config.window_width, config.window_height])
@@ -31,7 +45,12 @@ fn main() -> eframe::Result {
             viewport,
             ..Default::default()
         },
-        Box::new(move |cc| Ok(Box::new(App::with_startup(cc, startup)))),
+        Box::new(move |cc| {
+            let app = App::with_startup(cc, startup);
+            #[cfg(windows)]
+            let app = app.with_instance(instance);
+            Ok(Box::new(app))
+        }),
     )
 }
 

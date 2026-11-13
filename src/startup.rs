@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{ArgGroup, Parser};
+use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Protocol, Session, APP_VERSION};
 
@@ -16,7 +17,7 @@ pub struct Startup {
     pub connection: Option<Session>,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Serialize, Deserialize)]
 #[command(name = "imgossh", version = APP_VERSION,
     about = "SSH / SFTP / SCP workstation written in Rust")]
 #[command(group(ArgGroup::new("destination").args(["host", "hostname"])))]
@@ -59,6 +60,10 @@ pub struct Args {
 }
 
 impl Args {
+    pub fn is_jumpserver(&self) -> bool {
+        self.jumpserver
+    }
+
     pub fn into_startup(self, config: &Config) -> Startup {
         let explicit_host = self.hostname.is_some();
         let destination = self.hostname.or(self.host);

@@ -140,6 +140,8 @@ struct WorkspaceRunner {
 
 /// The application.
 pub struct App {
+    #[cfg(windows)]
+    instance: Option<crate::instance::Instance>,
     store: Store,
     palette: Palette,
     runtime: Arc<tokio::runtime::Runtime>,
@@ -245,6 +247,8 @@ impl App {
             Some(rx)
         };
         let mut app = Self {
+            #[cfg(windows)]
+            instance: None,
             store,
             palette,
             runtime,
@@ -291,6 +295,30 @@ impl App {
         }
         cc.egui_ctx.request_repaint();
         app
+    }
+
+    #[cfg(windows)]
+    pub fn with_instance(mut self, instance: Option<crate::instance::Instance>) -> Self {
+        if let (Some(instance), Some(ctx)) = (&instance, &self.ctx) {
+            instance.attach(ctx);
+        }
+        self.instance = instance;
+        self
+    }
+
+    #[cfg(windows)]
+    fn poll_launches(&mut self, ctx: &Context) {
+        while let Some(args) = self
+            .instance
+            .as_ref()
+            .and_then(|instance| instance.try_recv())
+        {
+            // Resolve defaults in the receiving window and preserve the runtime
+            // JumpServer flag (Session serialization deliberately omits it).
+            self.startup(&args.into_startup(&self.store.config));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
     }
 
     fn startup(&mut self, startup: &Startup) {
@@ -1090,6 +1118,8 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
         self.ctx = Some(ctx.clone());
+        #[cfg(windows)]
+        self.poll_launches(ctx);
         self.apply_theme(ctx);
         self.poll_prompts();
         self.poll_updater(ctx);
@@ -1201,6 +1231,9 @@ impl eframe::App for App {
             log::warn!("saving settings: {err}");
         }
         if self.restarting {
+            // Release the launch endpoint before starting the updated binary.
+            #[cfg(windows)]
+            self.instance.take();
             update::relaunch();
         }
     }
@@ -3329,10 +3362,74 @@ fn menu_is_dismissed(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
     #[test]
-    fn typing_keeps_the_native_window_layout_stable() {
+    fn jumpserver_handoff_adds_selected_tabs_and_restores_existing_window() {
         use super::*;
-        use eframe::App as _;
+        use crate::instance::{Instance, Launch};
+        use crate::startup::Args;
+        use clap::Parser;
+
+        let (mut app, _dir) = test_app();
+        let ctx = app.ctx.clone().unwrap();
+        let name = format!(r"\\.\pipe\ImGoSSH-ui-test-{}", std::process::id());
+        let Launch::Window(instance) =
+            Instance::start_at(&name, &Args::try_parse_from(["imgossh"]).unwrap()).unwrap()
+        else {
+            panic!("expected a window")
+        };
+        app = app.with_instance(instance);
+        app.new_tab(app.store.config.new_session(Protocol::Local));
+        let original = app.tabs[0].emu.clone();
+        // This reserved local port is not accepting connections; the test
+        // exercises tab creation without contacting an external SSH server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = format!("--port={}", listener.local_addr().unwrap().port());
+        for sftp in [false, true] {
+            let mut argv = vec![
+                "imgossh",
+                "--jumpserver",
+                "--host=127.0.0.1",
+                &port,
+                "--username=JMS-test",
+                "--password=temporary",
+            ];
+            if sftp {
+                argv.push("--sftp");
+            }
+            let args = Args::try_parse_from(argv).unwrap();
+            assert!(matches!(
+                Instance::start_at(&name, &args).unwrap(),
+                Launch::Forwarded
+            ));
+        }
+        let mut output = ctx.run_ui(Default::default(), |_| app.poll_launches(&ctx));
+        output.textures_delta.clear();
+        assert_eq!(app.tabs.len(), 3);
+        assert_eq!(app.active, 2);
+        assert!(Arc::ptr_eq(&original, &app.tabs[0].emu));
+        assert!(matches!(app.tabs[1].kind, TabKind::Terminal));
+        assert!(matches!(app.tabs[2].kind, TabKind::Sftp));
+        assert!(app.tabs[2].browser.is_some());
+        for tab in &app.tabs[1..] {
+            assert!(tab.session.jumpserver);
+            assert_eq!(tab.session.password, "temporary");
+            assert!(!tab.session.use_agent);
+            assert!(!tab.session.auto_tunnels);
+        }
+        assert!(app.store.sessions.is_empty());
+        let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Minimized(false))));
+        assert!(commands
+            .iter()
+            .any(|c| matches!(c, egui::ViewportCommand::Focus)));
+        drop(listener);
+    }
+
+    fn test_app() -> (super::App, tempfile::TempDir) {
+        use super::*;
         let dir = tempfile::tempdir().unwrap();
         let store = Store::load_from(dir.path(), false);
         let palette = store.config.palette();
@@ -3345,7 +3442,9 @@ mod tests {
         );
         let (prompter, prompts) = Prompter::channel();
         let ctx = Context::default();
-        let mut app = App {
+        let app = App {
+            #[cfg(windows)]
+            instance: None,
             store,
             palette,
             runtime,
@@ -3385,6 +3484,15 @@ mod tests {
             blink_at: 0.0,
             dirty: false,
         };
+        (app, dir)
+    }
+
+    #[test]
+    fn typing_keeps_the_native_window_layout_stable() {
+        use super::*;
+        use eframe::App as _;
+        let (mut app, _dir) = test_app();
+        let ctx = app.ctx.clone().unwrap();
         app.store.config.last_update_check = update::epoch_seconds(std::time::SystemTime::now());
         app.store.config.show_server_monitor = true;
         let session = app.store.config.new_session(Protocol::Ssh);
