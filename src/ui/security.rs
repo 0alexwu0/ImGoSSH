@@ -39,10 +39,14 @@ impl SecurityDialog {
         if store.sessions_locked() {
             Some(Self::new(Page::Unlock, store))
         } else if store.needs_encryption_prompt() {
-            Some(Self::new(Page::Offer, store))
+            Some(Self::offer(store))
         } else {
             None
         }
+    }
+
+    pub(crate) fn offer(store: &Store) -> Self {
+        Self::new(Page::Offer, store)
     }
 
     pub fn manage(store: &Store) -> Self {
@@ -145,7 +149,7 @@ impl SecurityDialog {
                     if self.page != Page::Offer && ui.button(if self.page == Page::Unlock {
                         t!("Continue without unlocking")
                     } else { t!("Cancel") }).clicked() {
-                        if self.page == Page::Manage && store.needs_encryption_prompt() {
+                        if self.page == Page::Manage && store.session_encryption_undecided() {
                             self.page = Page::Offer;
                             self.error.clear();
                         } else { done = true; }

@@ -60,6 +60,17 @@ jobs:
           fi
           echo "value=$version" >> "$GITHUB_OUTPUT"
 
+      - name: Check Dropbox configuration for releases
+        if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
+        env:
+          IMGOSSH_DROPBOX_APP_KEY: ${{ vars.IMGOSSH_DROPBOX_APP_KEY }}
+        shell: bash
+        run: |
+          if [[ ! "$IMGOSSH_DROPBOX_APP_KEY" =~ [^[:space:]] ]]; then
+            echo '::error::Set the IMGOSSH_DROPBOX_APP_KEY repository variable before publishing.'
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -73,6 +84,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - name: Build
+        env:
+          IMGOSSH_DROPBOX_APP_KEY: ${{ vars.IMGOSSH_DROPBOX_APP_KEY }}
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Test

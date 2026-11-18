@@ -545,6 +545,8 @@ pub struct Config {
     /// When a release check last finished, in seconds since the epoch, so that
     /// reopening the app does not immediately ask the same question again.
     pub last_update_check: i64,
+    pub sync_dropbox_account: String,
+    pub sync_revision: String,
 }
 
 impl Default for Config {
@@ -595,6 +597,8 @@ impl Default for Config {
             check_updates: true,
             skipped_version: String::new(),
             last_update_check: 0,
+            sync_dropbox_account: String::new(),
+            sync_revision: String::new(),
         }
     }
 }
@@ -721,13 +725,63 @@ impl Store {
             {
                 Ok(())
             }
-            SessionsAccess::Plain => {
-                atomic_write(&self.sessions_path, self.session_text()?.as_bytes())
+            _ => self.write_sessions(),
+        }
+    }
+
+    pub(crate) fn apply_synced(
+        &mut self,
+        config: Config,
+        sessions: Option<Vec<Session>>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.sessions_writable() && !self.needs_encryption_prompt(),
+            crate::t!("Unlock saved sessions or resolve the storage error before syncing.")
+        );
+        let Some(sessions) = sessions else {
+            return self.save_synced_settings(config);
+        };
+        anyhow::ensure!(
+            !self.session_encryption_undecided(),
+            crate::t!("Choose how to store new sessions on this computer before applying.")
+        );
+        write_toml(&self.config_path, &config)?;
+        let previous = std::mem::replace(&mut self.sessions, sessions);
+        if let Err(error) = self.write_sessions() {
+            self.sessions = previous;
+            return match write_toml(&self.config_path, &self.config) {
+                Ok(()) => Err(error),
+                Err(rollback) => {
+                    Err(error.context(format!("Restoring settings failed: {rollback:#}")))
+                }
+            };
+        }
+        self.config = config;
+        Ok(())
+    }
+
+    pub(crate) fn save_synced_settings(&mut self, config: Config) -> Result<()> {
+        write_toml(&self.config_path, &config)?;
+        self.config = config;
+        Ok(())
+    }
+
+    pub(crate) fn sync_credential_path(&self, account: &str) -> PathBuf {
+        let digest = ring::digest::digest(&ring::digest::SHA256, account.as_bytes());
+        let suffix =
+            base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, digest);
+        self.config_path
+            .with_file_name(format!("sync-dropbox-{suffix}"))
+    }
+
+    fn write_sessions(&self) -> Result<()> {
+        let text = self.session_text()?;
+        match &self.access {
+            SessionsAccess::Plain => atomic_write(&self.sessions_path, text.as_bytes()),
+            SessionsAccess::Encrypted(key) => {
+                atomic_write(&self.sessions_path, &key.seal(text.as_bytes())?)
             }
-            SessionsAccess::Encrypted(key) => atomic_write(
-                &self.sessions_path,
-                &key.seal(self.session_text()?.as_bytes())?,
-            ),
+            _ => anyhow::bail!("Saved sessions are not writable"),
         }
     }
 
@@ -770,9 +824,11 @@ impl Store {
     }
 
     pub fn needs_encryption_prompt(&self) -> bool {
-        matches!(self.access, SessionsAccess::Plain)
-            && !self.config.session_encryption_prompted
-            && (self.legacy_sessions || !self.sessions.is_empty())
+        self.session_encryption_undecided() && (self.legacy_sessions || !self.sessions.is_empty())
+    }
+
+    pub(crate) fn session_encryption_undecided(&self) -> bool {
+        matches!(self.access, SessionsAccess::Plain) && !self.config.session_encryption_prompted
     }
 
     pub fn decline_encryption(&mut self) -> Result<()> {

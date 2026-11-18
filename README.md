@@ -54,14 +54,14 @@ SFTP 可以作为独立标签页打开，也可以停靠在终端右侧。双栏
 
 ## 下载
 
-最新版本：[v0.3.4](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.4)
+最新版本：[v0.3.5](https://github.com/0alexwu0/ImGoSSH/releases/tag/v0.3.5)
 
 | 平台 | 安装包 | 运行方式 |
 | --- | --- | --- |
-| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-windows-x64.zip) | 解压后运行 `imgossh.exe` |
-| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
-| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-macos-aarch64.zip) | 解压后执行 `./imgossh` |
-| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.4/ImGoSSH-0.3.4-macos-x86_64.zip) | 解压后执行 `./imgossh` |
+| Windows x86-64 | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.5/ImGoSSH-0.3.5-windows-x64.zip) | 解压后运行 `imgossh.exe` |
+| Linux x86-64 | [tar.gz](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.5/ImGoSSH-0.3.5-linux-x86_64.tar.gz) | 解压后执行 `./imgossh` |
+| macOS Apple Silicon | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.5/ImGoSSH-0.3.5-macos-aarch64.zip) | 解压后执行 `./imgossh` |
+| macOS Intel | [ZIP](https://github.com/0alexwu0/ImGoSSH/releases/download/v0.3.5/ImGoSSH-0.3.5-macos-x86_64.zip) | 解压后执行 `./imgossh` |
 
 每个压缩包都包含图形客户端、`igssh`、`igscp`、`igsftp`、`LICENSE`、`README.md`、使用文档、JumpServer 连接器和反向工作区辅助脚本。Release 页面同时提供 SHA-256 校验值。
 
@@ -70,6 +70,13 @@ Linux 版本面向 glibc 2.35 及以上环境。macOS 版本目前没有开发�
 ```bash
 xattr -dr com.apple.quarantine <解压目录>
 ```
+
+## v0.3.5 更新
+
+- 新增 Dropbox 配置同步：从「设置 → 配置...」中「会话文件加密」的下方进入，手动发布加密快照或拉取并预览。连接密码和私钥不会上传。
+- SSH 终端的右键菜单采用与 SFTP 相同的样式，支持点击菜单外或按 `Esc` 关闭。
+
+详细说明见 [v0.3.5 发布说明](docs/release-0.3.5.md)。
 
 ## v0.3.4 更新
 
@@ -334,6 +341,26 @@ Release 构建会在 `target/release/` 生成四个程序。Windows 构建会尝
 | `known_hosts` | ImGoSSH 使用的主机密钥库 |
 
 设置 `IMGOSSH_HOME` 可以把整个数据目录移动到其他位置，例如 U 盘。调试时设置 `RUST_LOG=debug`。
+
+### 跨电脑配置同步
+
+在启用了 Dropbox 同步的版本中，只需要 Dropbox 账号，不用安装网盘客户端、挂载共享目录或自建服务器。
+
+1. 在源电脑打开「设置 → 配置...」，找到「会话文件加密」下方的「配置同步」，点击「管理配置同步 → 连接 Dropbox」。在浏览器同意授权，把 Dropbox 显示的一次性授权码粘贴回来。
+2. 输入并确认至少 12 个字符的独立同步密码（不要使用 Dropbox 账号密码），点击「发布快照」。快照 `ImGoSSH.igsync` 在本机加密后才上传到 Dropbox 的应用专用目录。授权保存在系统凭据库，同步密码不会保存，也不会发给 Dropbox。
+3. 在目标电脑授权同一个 Dropbox 账号，输入同一个同步密码，点击「拉取并预览」，确认后点击「应用」。首次在本机保存会话时，需先选择本机会话文件的加密方式。后续仍由用户手动发布和拉取。
+
+快照包含主题、语言等可移植偏好，以及 SSH、SFTP、SCP 会话的基本连接信息和分组。应用时覆盖这些偏好；按文件夹和名称匹配会话，仅在协议、主机、端口和用户名也一致时更新可同步字段。重名冲突会跳过，本机独有的会话不会删除，因此重命名和删除不会自动传播。若云端快照不是本机上次发布或应用的版本，须先拉取并应用再发布。
+
+授权失效时，点击「重新授权 Dropbox」并连接同一账号，即可保留本机同步进度。要更换账号，请先点击「断开此电脑」。断开不会删除网盘快照或本机配置；如需撤销 Dropbox 侧的授权，请在 Dropbox 的已连接应用设置中操作。
+
+连接密码、私钥及路径、已信任的主机密钥、本地终端会话、启动命令和脚本、隧道、反向工作区权限、SCP 传输路径和窗口尺寸不参与同步。请在每台电脑单独配置所需的认证及本地功能，并在首次连接时重新核对主机密钥。已有本机会话的加密方式不会改变。
+
+**发行维护者**：在 Dropbox 开发者后台注册一个 App Folder 应用，启用 `files.content.read` 和 `files.content.write` 权限；PKCE 公共客户端无需配置回调地址或提供应用密钥（App Secret）。将公开的 App Key 写入 GitHub Actions 仓库变量 `IMGOSSH_DROPBOX_APP_KEY`，或在本地构建时设置同名环境变量。正式发行缺少 App Key 时会中止；不设置也可在本地构建，Dropbox 同步入口将提示未启用。
+
+对外发行前，确保普通 Dropbox 用户能授权，并用同一测试账号在两台电脑上执行上述发布、拉取与应用流程。再在目标电脑修改可同步偏好并发布，确认源电脑不能直接覆盖新快照、拉取应用后可以发布。重新启动后应能直接拉取，不必再次粘贴授权码。
+
+### 本机会话加密
 
 会话文件加密可在“设置 → 管理加密与密码”中启用、关闭或修改密码。首次使用时，在首次新建会话并确认保存后询问是否设置密码；已有 `sessions.toml` 的用户升级后，启动时询问一次。选择设置后立即加密当前会话文件；选择暂不加密后，可随时从设置中启用。
 

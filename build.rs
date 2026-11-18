@@ -20,6 +20,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/icon.rs");
     println!("cargo:rerun-if-changed=assets/icon.png");
     println!("cargo:rerun-if-env-changed=IMGOSSH_RC");
+    println!("cargo:rerun-if-env-changed=IMGOSSH_DROPBOX_APP_KEY");
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

@@ -14,6 +14,7 @@ const VERSION: u8 = 1;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const ROUNDS: u32 = 600_000;
+#[cfg(test)]
 const HEADER_LEN: usize = MAGIC.len() + 1 + SALT_LEN + NONCE_LEN;
 
 pub(crate) struct Key {
@@ -57,11 +58,15 @@ impl Key {
     }
 
     pub(crate) fn seal(&self, plain: &[u8]) -> Result<Vec<u8>> {
+        self.seal_for(MAGIC, plain)
+    }
+
+    pub(crate) fn seal_for(&self, magic: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
         let mut nonce = [0; NONCE_LEN];
         SystemRandom::new()
             .fill(&mut nonce)
             .map_err(|_| anyhow!("Random generator failed"))?;
-        let mut out = MAGIC.to_vec();
+        let mut out = magic.to_vec();
         out.push(VERSION);
         out.extend_from_slice(&self.salt);
         out.extend_from_slice(&nonce);
@@ -78,22 +83,31 @@ impl Key {
     }
 
     pub(crate) fn open(data: &[u8], password: &str) -> Result<(Self, Zeroizing<Vec<u8>>)> {
-        if data.len() < HEADER_LEN + aead::AES_256_GCM.tag_len() || !is_encrypted(data) {
+        Self::open_for(MAGIC, data, password)
+    }
+
+    pub(crate) fn open_for(
+        magic: &[u8],
+        data: &[u8],
+        password: &str,
+    ) -> Result<(Self, Zeroizing<Vec<u8>>)> {
+        let header_len = magic.len() + 1 + SALT_LEN + NONCE_LEN;
+        if data.len() < header_len + aead::AES_256_GCM.tag_len() || !data.starts_with(magic) {
             bail!("Invalid encrypted session file");
         }
-        if data[MAGIC.len()] != VERSION {
+        if data[magic.len()] != VERSION {
             bail!("Unsupported session encryption version");
         }
-        let salt_start = MAGIC.len() + 1;
+        let salt_start = magic.len() + 1;
         let salt = data[salt_start..salt_start + SALT_LEN].try_into().unwrap();
-        let nonce = data[salt_start + SALT_LEN..HEADER_LEN].try_into().unwrap();
+        let nonce = data[salt_start + SALT_LEN..header_len].try_into().unwrap();
         let key = Self::derive(password, salt);
-        let mut body = Zeroizing::new(data[HEADER_LEN..].to_vec());
+        let mut body = Zeroizing::new(data[header_len..].to_vec());
         let len = key
             .cipher()?
             .open_in_place(
                 aead::Nonce::assume_unique_for_key(nonce),
-                aead::Aad::from(&data[..HEADER_LEN]),
+                aead::Aad::from(&data[..header_len]),
                 &mut body,
             )
             .map_err(|_| anyhow!("Incorrect password or damaged session file"))?

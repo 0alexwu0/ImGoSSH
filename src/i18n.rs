@@ -421,6 +421,61 @@ fn zh(key: &'static str) -> &'static str {
         "Scrollback lines" => "回滚行数",
         "Keepalive" => "保活",
 
+        "Configuration sync" => "配置同步",
+        "Manage configuration sync" => "管理配置同步",
+        "Sync an encrypted snapshot through your Dropbox account. No server or shared folder is required." =>
+            "通过 Dropbox 账号同步加密快照，无需搭建服务或挂载共享文件夹。",
+        "Connect Dropbox" => "连接 Dropbox",
+        "Dropbox not connected" => "未连接 Dropbox",
+        "Dropbox connected" => "已连接 Dropbox",
+        "Authorize Dropbox again" => "重新授权 Dropbox",
+        "Authorize the same Dropbox account, or disconnect this computer before switching accounts." =>
+            "请授权同一个 Dropbox 账号。若要切换账号，请先断开此电脑。",
+        "Disconnect this computer" => "断开此电脑",
+        "Approve access in your browser, then paste the Dropbox authorization code here." =>
+            "请在浏览器中同意授权，再将 Dropbox 显示的授权码粘贴到这里。",
+        "Finish connecting" => "完成连接",
+        "Dropbox sync is not configured in this build." => "此版本尚未启用 Dropbox 同步。",
+        "Could not start Dropbox authorization." => "无法启动 Dropbox 授权。",
+        "Dropbox authorization failed or expired. Authorize Dropbox again." => "Dropbox 授权失败或已过期，请重新授权。",
+        "Could not access Dropbox authorization in the system credential store." =>
+            "无法访问系统凭据库中的 Dropbox 授权，请检查凭据库或重新连接。",
+        "Could not connect to Dropbox. Check your internet connection." => "无法连接 Dropbox，请检查网络。",
+        "Dropbox returned an invalid response." => "Dropbox 返回了无效的响应。",
+        "Dropbox did not allow this action. Check the account and app permissions." =>
+            "Dropbox 拒绝了此操作，请检查账号和应用权限。",
+        "Dropbox is busy. Try again shortly." => "Dropbox 繁忙，请稍后重试。",
+        "Dropbox returned HTTP {0}." => "Dropbox 返回 HTTP {0}。",
+        "Sync password" => "同步密码",
+        "Confirm password for first publish" => "首次发布请确认同步密码",
+        "Pull and preview" => "拉取并预览",
+        "Publish snapshot" => "发布快照",
+        "Sessions: {0} new, {1} matched, {2} conflicts skipped." =>
+            "会话：新增 {0} 个，匹配 {1} 个，跳过 {2} 个冲突项。",
+        "Applying replaces portable preferences and merges sessions. No local sessions are deleted." =>
+            "应用后会覆盖可同步的偏好设置并合并会话，不会删除本机会话。",
+        "Connection passwords, private keys, local paths and permissions stay on this computer." =>
+            "连接密码、私钥、本机路径和权限设置仅保留在本机。",
+        "Synced configuration applied." => "已应用同步配置。",
+        "Choose local encryption" => "设置本机会话加密",
+        "Choose how to store new sessions on this computer before applying." =>
+            "应用前请选择是否加密保存在本机的新会话。",
+        "Snapshot published. You can now pull it on another computer." =>
+            "已发布快照，现在可以在另一台电脑上拉取。",
+        "Unlock saved sessions or resolve the storage error before syncing." =>
+            "请先解锁已保存的会话，或解决存储错误后再同步。",
+        "No sync snapshot in Dropbox. Publish one from another computer first." =>
+            "Dropbox 中还没有同步快照，请先在另一台电脑发布。",
+        "The cloud snapshot changed. Pull and apply it before publishing." =>
+            "云端快照已变更，请先拉取并应用，再发布。",
+        "Use at least 12 characters for the sync password." => "同步密码至少需要 12 个字符。",
+        "Incorrect sync password or unreadable snapshot." => "同步密码错误，或快照无法读取。",
+        "Invalid sync snapshot." => "同步快照无效。",
+        "Unsupported sync snapshot version." => "不支持此同步快照版本。",
+        "The sync snapshot is too large." => "同步快照过大。",
+        "Sync worker stopped unexpectedly." => "同步任务意外停止。",
+        "Could not sync: {0}" => "同步失败：{0}",
+
         // --- online updates ----------------------------------------------
         "Updates" => "更新",
         "Check for updates..." => "检查更新…",
@@ -640,6 +695,11 @@ mod tests {
             "Terminal",
             "Transfers",
             "Settings",
+            "Configuration sync",
+            "Manage configuration sync",
+            "Dropbox not connected",
+            "Publish snapshot",
+            "Pull and preview",
             "Help",
             "Download",
             "Upload",

@@ -14,6 +14,7 @@ pub mod dialogs;
 pub mod properties;
 mod security;
 pub mod sidebar;
+mod sync;
 pub mod terminal;
 pub mod theme;
 #[cfg(target_os = "windows")]

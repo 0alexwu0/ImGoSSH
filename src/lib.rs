@@ -15,6 +15,7 @@
 
 pub mod cli;
 pub mod config;
+mod dropbox;
 pub mod i18n;
 pub mod icon;
 #[cfg(windows)]
@@ -23,6 +24,7 @@ pub mod jumpserver;
 pub mod line_drawing;
 pub mod ssh;
 pub mod startup;
+mod sync;
 pub mod terminal;
 pub mod ui;
 pub mod update;

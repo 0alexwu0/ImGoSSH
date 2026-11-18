@@ -202,8 +202,6 @@ pub struct Output {
     pub resized: Option<(u16, u16)>,
     /// Text to put on the system clipboard.
     pub copy: Option<String>,
-    /// Where to open the right-click menu.
-    pub menu_at: Option<Pos2>,
     /// The notice asked for the session to be started again.
     pub restart: bool,
 }
@@ -688,10 +686,6 @@ pub struct Notice {
 
 /// Draw one terminal and read its input.
 ///
-/// `menu_open` tells the grid that its right-click menu is up. The menu
-/// floats over the cells, and a click on it must not be read as a click on a
-/// cell - that would collapse the very selection the menu is about to copy.
-///
 /// `notice` is what the owner of the session wants said about it no longer
 /// running. It gets the bottom strip of the well, and its button comes back as
 /// [`Output::restart`].
@@ -701,9 +695,8 @@ pub fn show(
     backend: &Arc<Mutex<Option<Backend>>>,
     st: &mut State,
     style: &Style<'_>,
-    menu_open: bool,
     notice: Option<&Notice>,
-) -> Output {
+) -> (Output, egui::Response) {
     let mut out = Output::default();
 
     // ---- geometry -------------------------------------------------------
@@ -734,6 +727,7 @@ pub fn show(
         span.y.min(available.y).max(style.grid.cell.y),
     ) + Vec2::new(2.0 * style.pad, 2.0 * style.pad + strip);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let menu_open = response.context_menu_opened() || response.secondary_clicked();
     let ready = backend.lock().unwrap().is_some();
     let can_focus =
         ui.is_enabled() && !menu_open && ui.memory(|mem| mem.is_above_modal_layer(ui.layer_id()));
@@ -794,9 +788,6 @@ pub fn show(
     // ---- pointer --------------------------------------------------------
     let pointer = ui.input(|i| i.pointer.clone());
     let hover = response.hover_pos();
-    if response.secondary_clicked() {
-        out.menu_at = hover;
-    }
     if response.middle_clicked() {
         if let Some(text) = clipboard_text() {
             type_into(emu, backend, InputEncoder(term_state).paste(&text));
@@ -940,7 +931,7 @@ pub fn show(
         }
     }
 
-    out
+    (out, response)
 }
 
 /// Preedit stays local; the shell only receives the committed UTF-8 text.
@@ -1552,7 +1543,7 @@ mod tests {
                 if other_focus {
                     ui.memory_mut(|mem| mem.request_focus(egui::Id::new("other-input")));
                 }
-                show(ui, emu, backend, st, &style, false, None);
+                show(ui, emu, backend, st, &style, None);
             },
         );
         output.textures_delta.clear();
@@ -1873,7 +1864,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = show(ui, &emu, &backend, &mut st, &style, false, None);
+                let _ = show(ui, &emu, &backend, &mut st, &style, None);
             },
         );
         // There is no renderer here to apply the font texture to.
@@ -1974,7 +1965,7 @@ mod tests {
         };
         let mut st = State::default();
         let mut output = ctx.run_ui(raw, |ui| {
-            let _ = show(ui, &emu, &backend, &mut st, &style, false, None);
+            let _ = show(ui, &emu, &backend, &mut st, &style, None);
         });
         // There is no renderer here to apply the font texture to.
         output.textures_delta.clear();
@@ -2032,7 +2023,7 @@ mod tests {
                 )),
                 ..Default::default()
             };
-            raw.events = vec![
+            let events = vec![
                 egui::Event::PointerMoved(at),
                 egui::Event::PointerButton {
                     pos: at,
@@ -2050,8 +2041,18 @@ mod tests {
                 radius: 0.0,
                 border: Color32::TRANSPARENT,
             };
+            let mut popup_id = None;
+            let mut output = ctx.run_ui(raw.clone(), |ui| {
+                let (_, response) = show(ui, &emu, &backend, &mut st, &style, None);
+                popup_id = Some(egui::Popup::default_response_id(&response));
+            });
+            output.textures_delta.clear();
+            raw.events = events;
             let mut output = ctx.run_ui(raw, |ui| {
-                let _ = show(ui, &emu, &backend, &mut st, &style, menu_open, None);
+                if menu_open {
+                    egui::Popup::open_id(ui.ctx(), popup_id.unwrap());
+                }
+                let _ = show(ui, &emu, &backend, &mut st, &style, None);
             });
             // There is no renderer here to apply the font texture to.
             output.textures_delta.clear();
@@ -2118,7 +2119,7 @@ mod tests {
             };
             let mut out = Output::default();
             let mut output = ctx.run_ui(raw, |ui| {
-                out = show(ui, &emu, &backend, &mut st, &style, false, notice);
+                out = show(ui, &emu, &backend, &mut st, &style, notice).0;
             });
             // There is no renderer here to apply the font texture to.
             output.textures_delta.clear();
@@ -2388,7 +2389,7 @@ mod tests {
                 ..Default::default()
             },
             |ui| {
-                let _ = show(ui, &emu, &backend, &mut st, &style, false, None);
+                let _ = show(ui, &emu, &backend, &mut st, &style, None);
             },
         );
         // There is no renderer here to apply the font texture to.

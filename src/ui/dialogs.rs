@@ -633,6 +633,7 @@ pub fn settings_dialog(
     open: &mut bool,
     encrypted: bool,
     security: &mut bool,
+    sync: &mut bool,
 ) -> bool {
     *open = true;
     let mut changed = false;
@@ -822,6 +823,18 @@ pub fn settings_dialog(
                             .size(11.5)
                             .color(warn),
                         );
+                    }
+
+                    theme::section(ui, t!("Configuration sync"));
+                    ui.label(if !crate::dropbox::available() {
+                        t!("Dropbox sync is not configured in this build.")
+                    } else if config.sync_dropbox_account.is_empty() {
+                        t!("Dropbox not connected")
+                    } else {
+                        t!("Dropbox connected")
+                    });
+                    if ui.button(t!("Manage configuration sync")).clicked() {
+                        *sync = true;
                     }
 
                     theme::section(ui, t!("Updates"));

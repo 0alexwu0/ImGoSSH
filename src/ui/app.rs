@@ -160,6 +160,7 @@ pub struct App {
     workspace_runner: Option<WorkspaceRunner>,
     show_settings: bool,
     security: Option<super::security::SecurityDialog>,
+    sync: Option<super::sync::SyncDialog>,
     deferred_startup: Option<Startup>,
     storage_error: Option<String>,
     jumpserver_report: Option<std::sync::mpsc::Receiver<anyhow::Result<crate::jumpserver::Report>>>,
@@ -177,10 +178,6 @@ pub struct App {
     update_failed_at: Option<std::time::SystemTime>,
     /// Set once the new binaries are on disk: `on_exit` starts the program.
     restarting: bool,
-    term_menu: Option<(egui::Pos2, usize)>,
-    /// Set on the frame the terminal menu opens, so the click that opened it
-    /// cannot be mistaken for the click that dismisses it.
-    term_menu_fresh: bool,
     /// The terminal grid every tab shares.
     grid: Grid,
     /// The `line_spacing` `grid` was measured against, so a change to it is
@@ -267,6 +264,7 @@ impl App {
             workspace_runner: None,
             show_settings: false,
             security,
+            sync: None,
             deferred_startup,
             storage_error,
             jumpserver_report,
@@ -278,8 +276,6 @@ impl App {
             update_seen: None,
             update_failed_at: None,
             restarting: false,
-            term_menu: None,
-            term_menu_fresh: false,
             grid,
             spacing,
             scale,
@@ -1157,7 +1153,7 @@ impl eframe::App for App {
         self.record_window_size(&ctx);
         self.tick_blink(&ctx);
 
-        if self.security.is_none() && self.storage_error.is_none() {
+        if self.security.is_none() && self.sync.is_none() && self.storage_error.is_none() {
             let shortcuts = self.take_shortcuts(&ctx);
             self.run_shortcuts(shortcuts, &ctx);
         }
@@ -2222,13 +2218,12 @@ impl App {
             radius: 11.0,
             border: theme::border(ui),
         };
-        let menu_open = self.term_menu.is_some_and(|(_, tab)| tab == index);
         let status = self.tabs[index].status.lock().unwrap().clone();
         let local = self.tabs[index].session.protocol == Protocol::Local;
         let notice = closed_notice(ui, &status, local);
         let tab = &mut self.tabs[index];
         // Each shell owns its focus/IME identity even when tabs share a pane.
-        let out = ui
+        let (out, response) = ui
             .push_id(Arc::as_ptr(&tab.emu), |ui| {
                 term_widget::show(
                     ui,
@@ -2236,7 +2231,6 @@ impl App {
                     &tab.backend,
                     &mut tab.view,
                     &style,
-                    menu_open,
                     notice.as_ref(),
                 )
             })
@@ -2250,11 +2244,6 @@ impl App {
         if let Some(text) = out.copy {
             ui.ctx().copy_text(text);
         }
-        if let Some(pos) = out.menu_at {
-            self.term_menu = Some((pos, index));
-            self.term_menu_fresh = true;
-        }
-
         let (resize, osc52) = {
             let mut emu = tab.emu.lock().unwrap();
             (emu.pending_resize.take(), emu.clipboard_request.take())
@@ -2272,6 +2261,17 @@ impl App {
         if bell != tab.bell_seen {
             tab.bell_seen = bell;
             tab.flash = ui.input(|i| i.time);
+        }
+
+        let was_open = response.context_menu_opened();
+        let action = terminal_context_menu(&response);
+        if was_open && !response.context_menu_opened() {
+            tab.view.want_focus = true;
+            ui.ctx().request_repaint();
+        }
+        if let Some(action) = action {
+            self.apply_terminal_menu_action(ui.ctx(), index, action);
+            return;
         }
 
         // Last, because opening the session again closes the tab this frame is
@@ -2820,12 +2820,12 @@ impl App {
                 self.name_prompt_ui(ui);
                 self.pending_ui(ui);
                 self.confirm_close_ui(ui);
-                self.term_menu_ui(ui);
                 self.workspace_runner_ui(ui);
 
                 if self.show_settings {
                     let mut settings_open = true;
                     let mut security = false;
+                    let mut sync = false;
                     let encrypted = self.store.sessions_encrypted();
                     if dialogs::settings_dialog(
                         ui,
@@ -2833,12 +2833,16 @@ impl App {
                         &mut settings_open,
                         encrypted,
                         &mut security,
+                        &mut sync,
                     ) {
                         self.dirty = true;
                     }
                     if security && (self.store.sessions_writable() || self.store.sessions_locked())
                     {
                         self.security = Some(super::security::SecurityDialog::manage(&self.store));
+                    }
+                    if sync && self.sync.is_none() {
+                        self.sync = Some(super::sync::SyncDialog::default());
                     }
                     if !settings_open {
                         self.show_settings = false;
@@ -2898,6 +2902,15 @@ impl App {
                     if let Some(startup) = self.deferred_startup.take() {
                         self.startup(&startup);
                     }
+                }
+            }
+        } else if let Some(dialog) = &mut self.sync {
+            match dialog.show(ctx, &mut self.store) {
+                super::sync::Action::Keep => {}
+                super::sync::Action::Close => self.sync = None,
+                super::sync::Action::ChooseLocalEncryption => {
+                    self.security = Some(super::security::SecurityDialog::offer(&self.store));
+                    ctx.request_repaint();
                 }
             }
         }
@@ -3257,56 +3270,16 @@ impl App {
         }
     }
 
-    fn term_menu_ui(&mut self, ui: &mut Ui) {
-        let fresh = std::mem::take(&mut self.term_menu_fresh);
-        let Some((pos, index)) = self.term_menu else {
-            return;
-        };
-        let mut action: Option<u8> = None;
-        let response = terminal_menu_window(pos).show(ui.ctx(), |ui| {
-            if ui.button(t!("Copy\tCtrl+Shift+C")).clicked() {
-                action = Some(0);
-            }
-            if ui.button(t!("Paste\tCtrl+Shift+V")).clicked() {
-                action = Some(1);
-            }
-            ui.separator();
-            if ui.button(t!("Select all")).clicked() {
-                action = Some(2);
-            }
-            if ui.button(t!("Scroll to bottom")).clicked() {
-                action = Some(3);
-            }
-            ui.separator();
-            if ui.button(t!("Toggle SFTP browser")).clicked() {
-                action = Some(4);
-            }
-            if ui.button(t!("Close tab\tCtrl+Shift+W")).clicked() {
-                action = Some(5);
-            }
-        });
-        let Some(inner) = response else { return };
-        let rect = inner.response.rect;
-
-        // A menu that has been used, dismissed or escaped out of is a menu that
-        // should be gone, and the grid wants its keyboard back: the menu button
-        // is focusable, so it took the focus when the click landed on it.
-        let pressed_outside = ui.input(|i| i.pointer.any_pressed())
-            && ui
-                .input(|i| i.pointer.press_origin())
-                .is_some_and(|p| !rect.contains(p));
-        let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
-        if menu_is_dismissed(action, pressed_outside, escape, fresh) {
-            self.term_menu = None;
-            if let Some(tab) = self.tabs.get_mut(index) {
-                tab.view.want_focus = true;
-            }
-        }
-
+    fn apply_terminal_menu_action(
+        &mut self,
+        ctx: &Context,
+        index: usize,
+        action: TerminalMenuAction,
+    ) {
         match action {
-            Some(0) => self.copy_selection(ui.ctx()),
-            Some(1) => self.paste_clipboard(),
-            Some(2) => {
+            TerminalMenuAction::Copy => self.copy_selection(ctx),
+            TerminalMenuAction::Paste => self.paste_clipboard(),
+            TerminalMenuAction::SelectAll => {
                 if let Some(tab) = self.tabs.get_mut(index) {
                     let (rows, cols) = tab.emu.lock().unwrap().size();
                     tab.view.selection = Some(term_widget::Selection {
@@ -3315,49 +3288,62 @@ impl App {
                     });
                 }
             }
-            Some(3) => {
+            TerminalMenuAction::ScrollToBottom => {
                 if let Some(tab) = self.tabs.get_mut(index) {
                     tab.emu.lock().unwrap().scroll_to_bottom();
                 }
             }
-            Some(4) => {
+            TerminalMenuAction::ToggleBrowser => {
                 self.active = index;
                 self.toggle_browser();
             }
-            Some(5) => self.close_tab(index),
-            _ => {}
+            TerminalMenuAction::CloseTab => self.close_tab(index),
         }
     }
 }
 
-fn terminal_menu_window(pos: egui::Pos2) -> egui::Window<'static> {
-    egui::Window::new("Terminal")
-        .id(egui::Id::new("terminal-menu"))
-        .title_bar(false)
-        .collapsible(false)
-        .resizable(false)
-        // Keep every menu item inside the viewport, including when opened
-        // near the bottom or right edge of the terminal.
-        .constrain(true)
-        .current_pos(pos)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TerminalMenuAction {
+    Copy,
+    Paste,
+    SelectAll,
+    ScrollToBottom,
+    ToggleBrowser,
+    CloseTab,
 }
 
-/// Should the open terminal menu be gone by the end of this frame?
-///
-/// Choosing an item, clicking anywhere else and Escape all dismiss it, and the
-/// dismissal happens on the press rather than the release so the menu vanishes
-/// the instant the user commits to something. The frame that opened the menu is
-/// exempt: a right-click pressed and released between two repaints reports its
-/// origin a pixel or two away from where it landed, and the menu is placed at
-/// the pointer, so that click would otherwise close the menu before it is ever
-/// drawn.
-fn menu_is_dismissed(
-    action: Option<u8>,
-    pressed_outside: bool,
-    escape: bool,
-    opened_this_frame: bool,
-) -> bool {
-    action.is_some() || (!opened_this_frame && (pressed_outside || escape))
+fn terminal_context_menu(response: &egui::Response) -> Option<TerminalMenuAction> {
+    let mut action = None;
+    response.context_menu(|ui| {
+        for (index, group) in [
+            [
+                (t!("Copy\tCtrl+Shift+C"), TerminalMenuAction::Copy),
+                (t!("Paste\tCtrl+Shift+V"), TerminalMenuAction::Paste),
+            ],
+            [
+                (t!("Select all"), TerminalMenuAction::SelectAll),
+                (t!("Scroll to bottom"), TerminalMenuAction::ScrollToBottom),
+            ],
+            [
+                (t!("Toggle SFTP browser"), TerminalMenuAction::ToggleBrowser),
+                (t!("Close tab\tCtrl+Shift+W"), TerminalMenuAction::CloseTab),
+            ],
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if index > 0 {
+                ui.separator();
+            }
+            for (label, item) in group {
+                if ui.button(label).clicked() {
+                    action = Some(item);
+                    ui.close();
+                }
+            }
+        }
+    });
+    action
 }
 
 #[cfg(test)]
@@ -3463,6 +3449,7 @@ mod tests {
             workspace_runner: None,
             show_settings: false,
             security: None,
+            sync: None,
             deferred_startup: None,
             storage_error: None,
             jumpserver_report: None,
@@ -3474,8 +3461,6 @@ mod tests {
             update_seen: None,
             update_failed_at: None,
             restarting: false,
-            term_menu: None,
-            term_menu_fresh: false,
             grid: Grid::default(),
             spacing: 0.0,
             scale: 0.0,
@@ -3829,32 +3814,99 @@ mod tests {
         }
     }
 
-    /// The menu closes the moment it is used, and never survives a click that
-    /// did not open it.
+    fn draw_terminal_menu(
+        ctx: &Context,
+        screen: egui::Rect,
+        events: Vec<egui::Event>,
+    ) -> (
+        Option<egui::Rect>,
+        Option<TerminalMenuAction>,
+        egui::FullOutput,
+    ) {
+        let mut rect = None;
+        let mut action = None;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(screen),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let response = ui.interact(
+                    screen,
+                    ui.id().with("terminal"),
+                    egui::Sense::click_and_drag(),
+                );
+                action = terminal_context_menu(&response);
+                if response.context_menu_opened() {
+                    rect = ctx
+                        .read_response(egui::Popup::default_response_id(&response))
+                        .map(|popup| popup.rect);
+                }
+            },
+        );
+        output.textures_delta.clear();
+        (rect, action, output)
+    }
+
+    fn menu_click(pos: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        events.extend([true, false].map(|pressed| egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }));
+        events
+    }
+
     #[test]
-    fn the_terminal_menu_closes_as_soon_as_it_is_used() {
-        for action in [Some(0u8), Some(5)] {
-            assert!(
-                menu_is_dismissed(action, false, false, true),
-                "choosing an item must close the menu even on its opening frame"
-            );
-        }
-        assert!(
-            menu_is_dismissed(None, true, false, false),
-            "a click outside closes the menu"
-        );
-        assert!(
-            menu_is_dismissed(None, false, true, false),
-            "Escape closes the menu"
-        );
-        assert!(
-            !menu_is_dismissed(None, false, false, false),
-            "an idle frame keeps the menu open"
-        );
-        assert!(
-            !menu_is_dismissed(None, true, true, true),
-            "the right-click that opened the menu must not close it again"
-        );
+    fn terminal_context_menu_closes_on_action_outside_click_and_escape() {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let ctx = Context::default();
+        let open = || {
+            draw_terminal_menu(&ctx, screen, vec![]);
+            let click = menu_click(screen.center(), egui::PointerButton::Secondary);
+            draw_terminal_menu(&ctx, screen, click);
+            let (rect, action, output) = draw_terminal_menu(&ctx, screen, vec![]);
+            assert!(rect.is_some(), "the right click must open the menu");
+            assert_eq!(action, None);
+            output
+        };
+
+        let output = open();
+        let copy = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == t!("Copy\tCtrl+Shift+C") => {
+                    Some(text.pos + text.galley.size() / 2.0)
+                }
+                _ => None,
+            })
+            .expect("Copy was not rendered");
+        let click = menu_click(copy, egui::PointerButton::Primary);
+        let (rect, action, _) = draw_terminal_menu(&ctx, screen, click);
+        assert_eq!(action, Some(TerminalMenuAction::Copy));
+        assert!(rect.is_none());
+
+        open();
+        let click = menu_click(egui::pos2(20.0, 20.0), egui::PointerButton::Primary);
+        let (rect, action, _) = draw_terminal_menu(&ctx, screen, click);
+        assert!(rect.is_none());
+        assert_eq!(action, None);
+
+        open();
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let (rect, action, _) = draw_terminal_menu(&ctx, screen, vec![escape]);
+        assert!(rect.is_none());
+        assert_eq!(action, None);
     }
 
     #[test]
@@ -3865,34 +3917,14 @@ mod tests {
             egui::pos2(30.0, 598.0),
         ] {
             let ctx = Context::default();
-            let mut rect = egui::Rect::NOTHING;
-            for _ in 0..3 {
-                let mut output = ctx.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(screen),
-                        ..Default::default()
-                    },
-                    |ui| {
-                        rect = terminal_menu_window(pos)
-                            .show(ui.ctx(), |ui| {
-                                for text in [
-                                    "Copy\tCtrl+Shift+C",
-                                    "Paste\tCtrl+Shift+V",
-                                    "Select all",
-                                    "Scroll to bottom",
-                                    "Toggle SFTP browser",
-                                    "Close tab\tCtrl+Shift+W",
-                                ] {
-                                    let _ = ui.button(text);
-                                }
-                            })
-                            .unwrap()
-                            .response
-                            .rect;
-                    },
-                );
-                output.textures_delta.clear();
-            }
+            draw_terminal_menu(&ctx, screen, vec![]);
+            draw_terminal_menu(
+                &ctx,
+                screen,
+                menu_click(pos, egui::PointerButton::Secondary),
+            );
+            draw_terminal_menu(&ctx, screen, vec![]);
+            let rect = draw_terminal_menu(&ctx, screen, vec![]).0.unwrap();
             assert!(
                 screen.expand(1.0).contains_rect(rect),
                 "menu at {pos:?} is clipped: {rect:?}"
